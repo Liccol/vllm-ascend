@@ -13,7 +13,8 @@ class TestMinPLogitsProcessorInitFunc(PytestBase):
                                                    mocker: MockerFixture):
         mock_min_p_logits_processor = mocker.MagicMock(
             spec=MinPLogitsProcessor)
-        mock_min_p_logits_processor.min_p_cpu is None
+        mock_min_p_logits_processor.min_p_cpu = None
+
         mock_vllm_config = mocker.MagicMock(spec=VllmConfig)
         mock_scheduler_config = mocker.MagicMock(spec=SchedulerConfig)
         mock_scheduler_config.decode_max_num_seqs = 0
