@@ -48,10 +48,11 @@ class TestMinPLogitsProcessorInitFunc(PytestBase):
         mocker.patch(
             "vllm_ascend.ops.min_p_logits_processor.original_min_p_logits_processor_init_func",
             return_value=None)
+        # torch.zeros return error on online ut machine, thus mock it
         mock_tensor = torch.zeros((256, ),
                                   dtype=torch.float32,
                                   pin_memory=False)
-        mocker.patch("torch.zero", return_value=mock_tensor)
+        mocker.patch("torch.zeros", return_value=mock_tensor)
         mock_empty_tensor = torch.empty((256, ), dtype=torch.float32)
         mocker.patch("torch.empty", return_value=mock_empty_tensor)
 
@@ -77,6 +78,10 @@ class TestMinPLogitsProcessorInitFunc(PytestBase):
         mocker.patch(
             "vllm_ascend.ops.min_p_logits_processor.original_min_p_logits_processor_init_func",
             return_value=None)
+        mock_tensor = torch.zeros((256, ),
+                                  dtype=torch.float32,
+                                  pin_memory=False)
+        mocker.patch("torch.zeros", return_value=mock_tensor)
 
         min_p_logits_processor_init_func(mock_min_p_logits_processor,
                                          mock_vllm_config, "cpu", False)
