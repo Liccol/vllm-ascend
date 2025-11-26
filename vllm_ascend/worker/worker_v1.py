@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+#from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -86,7 +86,7 @@ class NPUWorker(WorkerBase):
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
-        _register_atb_extensions()
+        #_register_atb_extensions()
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
@@ -344,7 +344,8 @@ class NPUWorker(WorkerBase):
         x = torch.rand((2, 4), dtype=torch.float16).npu()
         weight = torch.rand((2, 4), dtype=torch.float16).npu()
         c = torch.rand((4, 4), dtype=torch.float32).npu()
-        torch_npu._npu_matmul_add_fp32(x, weight, c)
+        #torch_npu._npu_matmul_add_fp32(x, weight, c)
+        c.addmm_(x.t(), weight)
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
