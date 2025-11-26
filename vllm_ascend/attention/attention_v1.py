@@ -1518,13 +1518,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 sparse_mode=sparse_mode,
                 block_size=block_size,
                 input_layout=input_layout)
-            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                output[:batch_size] = output_data.view(batch_size,
-                                                       self.num_heads,
-                                                       self.head_size)
-            else:
-                output[:num_tokens] = output_data
-            return output
+        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+            output[:batch_size] = output_data.view(batch_size,
+                                                   self.num_heads,
+                                                   self.head_size)
+        else:
+            output[:num_tokens] = output_data
+        return output
 
     def forward(
         self,
