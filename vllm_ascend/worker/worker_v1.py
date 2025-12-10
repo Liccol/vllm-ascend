@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+#from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -88,7 +88,7 @@ class NPUWorker(WorkerBase):
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
-        _register_atb_extensions()
+        #_register_atb_extensions()
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
