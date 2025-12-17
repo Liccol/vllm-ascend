@@ -481,27 +481,28 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self.o_proj)
 
         if self.enable_mlapo:
-            quant_method = getattr(
-                getattr(self.fused_qkv_a_proj, "quant_method", None),
-                "quant_method",
-                None,
-            )
-            reasons = []
-            if self.fused_qkv_a_proj is None or not isinstance(
-                    quant_method, AscendW8A8LinearMethod):
-                reasons.append(
-                    "Currently mlapo only supports W8A8 quantization in SFA scenario."
-                    "Some layers in your model are not quantized with W8A8,"
-                    "thus mlapo is disabled for these layers.")
-            if self.enable_sfa_cp:
-                reasons.append("Currently mlapo does not support SFA with CP,"
-                               "thus mlapo is disabled for these layers.")
-            if reasons:
-                self.enable_mlapo = False
-                for msg in reasons:
-                    logger.warning_once(msg)
-            else:
-                self._process_weights_for_fused_mlapo(act_dtype)
+            # quant_method = getattr(
+            #     getattr(self.fused_qkv_a_proj, "quant_method", None),
+            #     "quant_method",
+            #     None,
+            # )
+            # reasons = []
+            # if self.fused_qkv_a_proj is None or not isinstance(
+            #         quant_method, AscendW8A8LinearMethod):
+            #     reasons.append(
+            #         "Currently mlapo only supports W8A8 quantization in SFA scenario."
+            #         "Some layers in your model are not quantized with W8A8,"
+            #         "thus mlapo is disabled for these layers.")
+            # if self.enable_sfa_cp:
+            #     reasons.append("Currently mlapo does not support SFA with CP,"
+            #                    "thus mlapo is disabled for these layers.")
+            # if reasons:
+            #     self.enable_mlapo = False
+            #     for msg in reasons:
+            #         logger.warning_once(msg)
+            # else:
+            #     self._process_weights_for_fused_mlapo(act_dtype)
+            self._process_weights_for_fused_mlapo_for_bf16(act_dtype)
 
     def _v_up_proj(self, x):
         forward_context = get_forward_context()
@@ -608,6 +609,48 @@ class AscendSFAImpl(MLAAttentionImpl):
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
+    def _process_weights_for_fused_mlapo_for_bf16(self, act_dtype: torch.dtype):
+        assert self.kv_a_proj_with_mqa is None
+        assert self.fused_qkv_a_proj is not None
+
+        kv_a_proj_wt = self.fused_qkv_a_proj.weight.data[
+            ..., self.q_lora_rank:].contiguous()
+        q_a_proj_wt = self.fused_qkv_a_proj.weight.data[
+            ..., :self.q_lora_rank].contiguous()
+
+        kv_a_proj_wt = kv_a_proj_wt.t().contiguous()
+        kv_a_proj_wt = trans_rope_weight(kv_a_proj_wt, self.qk_rope_head_dim)
+        kv_a_proj_wt = kv_a_proj_wt.t().contiguous()
+        wd_qkv = torch.cat((kv_a_proj_wt, q_a_proj_wt), dim=-1)
+        wd_qkv = wd_qkv.t().contiguous()
+        wd_qkv = transdata(wd_qkv,
+                           block_size=(16, 32)).unsqueeze(0).contiguous()
+        self.wd_qkv = torch_npu.npu_format_cast(wd_qkv, 29)
+
+        wu_q = self.q_proj.weight.data
+        wu_q = wu_q.t().reshape(self.num_heads,
+                                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                                -1)
+        wu_q = trans_rope_weight(wu_q, self.qk_rope_head_dim)
+        wu_q = wu_q.reshape(
+            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim),
+            -1)
+        wu_q = transdata(wu_q, block_size=(16, 32)).unsqueeze(0).contiguous()
+        self.wu_q = torch_npu.npu_format_cast(wu_q, 29)
+
+        self.gamma1 = self.q_a_layernorm.weight.data
+        self.gamma2 = self.kv_a_layernorm.weight.data
+
+        if self.vllm_config.kv_transfer_config is not None and \
+            self.vllm_config.kv_transfer_config.is_kv_consumer:
+            self.fused_qkv_a_proj.weight = None
+            self.fused_qkv_a_proj.deq_scale = None
+            self.fused_qkv_a_proj.quant_bias = None
+            self.q_proj.weight = None
+            self.q_proj.deq_scale = None
+            self.q_proj.quant_bias = None
+            torch.npu.empty_cache()
+
     # Processing the input parameters for MLAPO by reordering and transposing
     # QKV(and part of Q) weight, applying RoPE-related dimension transformations,
     # and handling quantization parameters.
@@ -704,6 +747,66 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.q_proj.quant_bias = None
             torch.npu.empty_cache()
 
+    def _sfa_preprocess_decode_for_bf16(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: M,
+        need_gather_q_kv: bool,
+        num_input_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+            hidden_states.contiguous(), need_gather_q_kv)
+        k_nope, k_pe = kv_cache[0], kv_cache[1]
+        ql_nope = torch.empty(
+            (num_input_tokens, self.W_UK_T.shape[0], k_nope.shape[-1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        q_pe = torch.empty(
+            (num_input_tokens, self.W_UK_T.shape[0], k_pe.shape[-1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        q_c = torch.empty(
+            (num_input_tokens, self.q_lora_rank),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops._C_ascend.mla_preprocess(
+            hidden_states,
+            self.wd_qkv,
+            None,
+            self.gamma1,
+            None,
+            self.wu_q,
+            None,
+            self.gamma2,
+            attn_metadata.cos,
+            attn_metadata.sin,
+            self.W_UK_T,
+            k_nope,
+            k_pe,
+            attn_metadata.slot_mapping,
+            quant_scale0=None,
+            quant_offset0=None,
+            bias0=None,
+            quant_scale1=None,
+            quant_offset1=None,
+            bias1=None,
+            ctkv_scale=None,
+            q_nope_scale=None,
+            cache_mode="krope_ctkv",
+            quant_mode="no_quant",
+            enable_inner_out=True,
+            q_out0=ql_nope,
+            kv_cache_out0=k_nope,
+            q_out1=q_pe,
+            kv_cache_out1=k_pe,
+            inner_out=q_c,
+        )
+        return hidden_states, ql_nope, q_pe, q_c
+
     def _sfa_preprocess_decode(
         self,
         hidden_states: torch.Tensor,
@@ -794,7 +897,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         output_padded = output
 
         if self.enable_mlapo and not forward_context.with_prefill:
-            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_decode(
+            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_decode_for_bf16(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata,
