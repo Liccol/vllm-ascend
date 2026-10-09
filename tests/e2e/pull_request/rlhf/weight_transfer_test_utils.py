@@ -41,6 +41,7 @@ class WeightUpdateModelCase:
     checkpoint_model_prefix: str | None = None
     checkpoint_name_map: Callable[[str], str] | None = None
     expert_intermediate_size: int | None = None
+    parameter_metadata_factory: Callable[[Any], list[ParamMeta]] | None = None
     extra_server_args: tuple[str, ...] = ()
     skip_reason: str | None = None
     """Why neither lane can carry this case yet.
@@ -144,6 +145,93 @@ def deepseek_v4_checkpoint_name(name: str) -> str:
         if name.endswith(old):
             return name[: -len(old)] + new
     return name
+
+
+def minimax_m3_parameter_metadata(config: Any) -> list[ParamMeta]:
+    """Enumerate the text checkpoint without a Transformers model implementation.
+
+    MiniMax-M3 publishes AutoConfig but no AutoModelForCausalLM. Names, shapes
+    and dtypes follow its safetensors headers, including the FP32 router and
+    routing bias and the shared (rather than per-head) index-key projection.
+    Vision and MTP weights are excluded because this case serves the text model
+    without speculative decoding.
+    """
+    hidden = config.hidden_size
+    head_dim = config.head_dim
+    query_dim = config.num_attention_heads * head_dim
+    kv_dim = config.num_key_value_heads * head_dim
+    sparse = config.sparse_attention_config
+    parameters: list[ParamMeta] = []
+
+    def add(name: str, shape: tuple[int, ...], dtype: torch.dtype = torch.bfloat16) -> None:
+        parameters.append(ParamMeta(f"language_model.{name}", dtype, shape))
+
+    def add_mlp(prefix: str, intermediate: int) -> None:
+        add(f"{prefix}.gate_proj.weight", (intermediate, hidden))
+        add(f"{prefix}.up_proj.weight", (intermediate, hidden))
+        add(f"{prefix}.down_proj.weight", (hidden, intermediate))
+
+    add("model.embed_tokens.weight", (config.vocab_size, hidden))
+    add("model.norm.weight", (hidden,))
+    add("lm_head.weight", (config.vocab_size, hidden))
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}"
+        add(f"{prefix}.input_layernorm.weight", (hidden,))
+        add(f"{prefix}.post_attention_layernorm.weight", (hidden,))
+        for projection, dimension in (("q", query_dim), ("k", kv_dim), ("v", kv_dim)):
+            add(f"{prefix}.self_attn.{projection}_proj.weight", (dimension, hidden))
+        add(f"{prefix}.self_attn.o_proj.weight", (hidden, query_dim))
+        for projection in ("q", "k"):
+            add(f"{prefix}.self_attn.{projection}_norm.weight", (head_dim,))
+        if sparse["sparse_attention_freq"][layer]:
+            index_dim = sparse["sparse_index_dim"]
+            add(f"{prefix}.self_attn.index_q_proj.weight", (sparse["sparse_num_index_heads"] * index_dim, hidden))
+            add(f"{prefix}.self_attn.index_k_proj.weight", (index_dim, hidden))
+            for projection in ("q", "k"):
+                add(f"{prefix}.self_attn.index_{projection}_norm.weight", (index_dim,))
+        if not config.moe_layer_freq[layer]:
+            add_mlp(f"{prefix}.mlp", config.dense_intermediate_size)
+            continue
+        moe = f"{prefix}.block_sparse_moe"
+        add(f"{moe}.gate.weight", (config.num_local_experts, hidden), torch.float32)
+        if config.use_routing_bias:
+            add(f"{moe}.e_score_correction_bias", (config.num_local_experts,), torch.float32)
+        if config.n_shared_experts:
+            add_mlp(f"{moe}.shared_experts", config.intermediate_size * config.n_shared_experts)
+        for expert in range(config.num_local_experts):
+            for projection in ("w1", "w3"):
+                add(f"{moe}.experts.{expert}.{projection}.weight", (config.intermediate_size, hidden))
+            add(f"{moe}.experts.{expert}.w2.weight", (hidden, config.intermediate_size))
+    return parameters
+
+
+MINIMAX_M3_CASE = WeightUpdateModelCase(
+    id="minimax-m3-sparse-moe-layout",
+    model="MiniMax/MiniMax-M3",
+    hf_overrides={
+        "architectures": ["MiniMaxM3SparseForCausalLM"],
+        "text_config": {
+            "num_hidden_layers": 4,
+            "num_local_experts": 8,
+            "moe_layer_freq": [0, 0, 0, 1],
+            "sparse_attention_config": {
+                "use_sparse_attention": True,
+                "sparse_index_dim": 128,
+                "sparse_num_index_heads": 4,
+                "sparse_topk_blocks": 16,
+                "sparse_block_size": 128,
+                "sparse_disable_index_value": [0, 0, 0, 1],
+                "sparse_score_type": "max",
+                "sparse_init_block": 0,
+                "sparse_local_block": 1,
+                "sparse_attention_freq": [0, 0, 0, 1],
+            },
+        },
+    },
+    meta_config_attribute="text_config",
+    parameter_metadata_factory=minimax_m3_parameter_metadata,
+    extra_server_args=("--block-size", "128"),
+)
 
 
 MODEL_CASES = (
@@ -260,11 +348,11 @@ def resize_expert_shape(name: str, shape: tuple[int, ...], intermediate_size: in
     return shape
 
 
-def pytest_model_cases() -> list[Any]:
+def pytest_model_cases(cases: tuple[WeightUpdateModelCase, ...] = MODEL_CASES) -> list[Any]:
     """Return model params with per-checkpoint CI discovery markers."""
     import pytest
 
-    return [pytest.param(case, id=case.id, marks=pytest.mark.e2e_model(case.model)) for case in MODEL_CASES]
+    return [pytest.param(case, id=case.id, marks=pytest.mark.e2e_model(case.model)) for case in cases]
 
 
 _ENGINES_REGISTERED = False
@@ -304,7 +392,8 @@ FIXED_WEIGHT_SEED = 20260915
 class FixedRandomWeightSource(WeightSource):
     """Generate every reduced-model parameter deterministically on demand.
 
-    A meta-device Transformers model provides the complete checkpoint-facing
+    A case-specific metadata factory or meta-device Transformers model provides
+    the complete checkpoint-facing
     name and shape set without allocating model storage. Each iteration derives
     a stable per-parameter seed and regenerates the same BF16 values, avoiding
     both checkpoint weight downloads and a persistent second model copy.
@@ -320,43 +409,46 @@ class FixedRandomWeightSource(WeightSource):
         _apply_hf_overrides(config, case.hf_overrides)
         self._case = case
         meta_config = getattr(config, case.meta_config_attribute) if case.meta_config_attribute else config
-        with torch.device("meta"):
-            meta_model = AutoModelForCausalLM.from_config(meta_config, trust_remote_code=True)
+        if case.parameter_metadata_factory is not None:
+            parameters = [(meta.name, meta.shape, meta.dtype) for meta in case.parameter_metadata_factory(meta_config)]
+        else:
+            with torch.device("meta"):
+                meta_model = AutoModelForCausalLM.from_config(meta_config, trust_remote_code=True)
 
-        # Two distinct steps: ``_checkpoint_name`` applies the namespace prefix
-        # to the raw meta-model name (once), then the checkpoint rename map runs
-        # on the *expanded* names, because the meta model exposes routed experts
-        # fused and the per-expert names (gate/up/down -> w1/w3/w2) only exist
-        # after ``expand_fused_expert_params`` has split them.
-        parameters = [
-            (
-                self._apply_name_map(expanded_name, case),
-                resize_expert_shape(expanded_name, expanded_shape, case.expert_intermediate_size),
-                torch.bfloat16,
-            )
-            for name, parameter in meta_model.named_parameters()
-            for expanded_name, expanded_shape in expand_fused_expert_params(
-                self._checkpoint_name(name, case), tuple(parameter.shape)
-            )
-        ]
-        # Learned integer tables must travel with the payload too. Some
-        # architectures expose them as HF *buffers* while the served model keeps
-        # them as parameters: DeepSeek-V4's hash router keeps ``tid2eid`` as a
-        # (vocab, topk) token -> expert table, and the real checkpoint ships it
-        # (``model.layers.{0,1,2}.mlp.gate.tid2eid`` in the safetensors index).
-        # Omitting it leaves the table to be re-materialised with ``torch.empty``
-        # during a live update, and the router then indexes experts out of range.
-        parameters += [
-            (
-                self._apply_name_map(self._checkpoint_name(name, case), case),
-                tuple(buffer.shape),
-                buffer.dtype,
-            )
-            for name, buffer in meta_model.named_buffers()
-            if not buffer.dtype.is_floating_point and not buffer.dtype.is_complex
-        ]
+            # Two distinct steps: ``_checkpoint_name`` applies the namespace prefix
+            # to the raw meta-model name (once), then the checkpoint rename map runs
+            # on the *expanded* names, because the meta model exposes routed experts
+            # fused and the per-expert names (gate/up/down -> w1/w3/w2) only exist
+            # after ``expand_fused_expert_params`` has split them.
+            parameters = [
+                (
+                    self._apply_name_map(expanded_name, case),
+                    resize_expert_shape(expanded_name, expanded_shape, case.expert_intermediate_size),
+                    torch.bfloat16,
+                )
+                for name, parameter in meta_model.named_parameters()
+                for expanded_name, expanded_shape in expand_fused_expert_params(
+                    self._checkpoint_name(name, case), tuple(parameter.shape)
+                )
+            ]
+            # Learned integer tables must travel with the payload too. Some
+            # architectures expose them as HF *buffers* while the served model keeps
+            # them as parameters: DeepSeek-V4's hash router keeps ``tid2eid`` as a
+            # (vocab, topk) token -> expert table, and the real checkpoint ships it
+            # (``model.layers.{0,1,2}.mlp.gate.tid2eid`` in the safetensors index).
+            # Omitting it leaves the table to be re-materialised with ``torch.empty``
+            # during a live update, and the router then indexes experts out of range.
+            parameters += [
+                (
+                    self._apply_name_map(self._checkpoint_name(name, case), case),
+                    tuple(buffer.shape),
+                    buffer.dtype,
+                )
+                for name, buffer in meta_model.named_buffers()
+                if not buffer.dtype.is_floating_point and not buffer.dtype.is_complex
+            ]
+            del meta_model
         self._num_experts = int(getattr(meta_config, "n_routed_experts", 0) or 0)
-        del meta_model
 
         assert parameters, f"{case.id}: reduced meta model contains no parameters"
         names = [name for name, _, _ in parameters]

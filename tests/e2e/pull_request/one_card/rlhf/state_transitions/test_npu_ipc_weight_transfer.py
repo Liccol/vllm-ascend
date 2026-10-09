@@ -10,7 +10,7 @@ restoration, derived FP32 routing weights, and SFA source/derived-state
 restoration. Cases whose model is not ready for the transaction are skipped in
 both lanes with a per-case ``skip_reason`` — DeepSeek-V4-Flash needs the
 attention-sink fix that lives in #16355 — so the matrix carries Qwen3.5-35B-A3B
-and GLM-5.1 today.
+and GLM-5.1, plus MiniMax-M3's dense/sparse attention and fused-MoE layout.
 
 The correctness oracle is *normal startup loading of the same payload*, not the
 first live update: the generator also writes a temporary checkpoint, a reference
@@ -43,6 +43,8 @@ from vllm.utils.network_utils import get_open_port
 
 from tests.e2e.conftest import RemoteOpenAIServer
 from tests.e2e.pull_request.rlhf.weight_transfer_test_utils import (
+    MINIMAX_M3_CASE,
+    MODEL_CASES,
     FixedRandomWeightSource,
     WeightUpdateModelCase,
     assert_weight_update_matches_reference,
@@ -78,7 +80,7 @@ def _post(server: RemoteOpenAIServer, route: str, *, json=None, params=None, tim
     torch.npu.device_count() < 1,
     reason="NPU IPC weight transfer e2e test requires at least 1 NPU.",
 )
-@pytest.mark.parametrize("case", pytest_model_cases())
+@pytest.mark.parametrize("case", pytest_model_cases((*MODEL_CASES, MINIMAX_M3_CASE)))
 @pytest.mark.parametrize("packed", [False, True], ids=["unpacked", "packed"])
 def test_npu_ipc_weight_transfer_transaction(case: WeightUpdateModelCase, packed: bool):
     if case.skip_reason is not None:
