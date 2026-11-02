@@ -456,3 +456,130 @@ QAT 时，需要新增训练/导出协议测试，但可以复用全新加载 re
 5. 所有承诺持久化的 buffer 地址保持稳定；
 6. 人为删除 scale 或跳过 post-process 时，测试会失败并给出明确定位；
 7. 测试不启动 RL trainer，也不需要下载完整模型权重。
+
+## 14. 如何替换为真实 checkpoint 权重
+
+本节是用户自行改造测试数据入口的指导，**当前脚本尚未实现 checkpoint 配置参数**。
+当前实现创建普通 Parameter 并使用默认 loader，验证的是层级布局恢复和更新；
+不覆盖完整模型的参数名映射、TP/EP 分片或真实训练传输。前文描述的完整模型
+loader 覆盖属于设计目标，不能视为现有测试已经具备的能力。
+
+### 14.1 配置入口与替换位置
+
+建议新增一个 JSON 配置文件，由 pytest fixture 读取，避免将机器路径写死在代码中。
+可以在 conftest.py 中通过 pytest_addoption 注册 `--mx-weight-config`，默认值为 None；
+未提供时保留当前随机权重测试，提供时由 fixture 加载配置并传给 payload 构造函数。
+下面的选项是建议接口，添加注册和加载逻辑后才能使用：
+
+```bash
+python -m pytest -sv tests/e2e/pull_request/one_card/test_rl_mx_weight_update.py \
+  --mx-weight-config=/data/rl-mx/weights.json
+```
+
+配置示例（参数名必须按实际 checkpoint 修改）：
+
+```json
+{
+  "checkpoints": ["/data/model/step0", "/data/model/step1", "/data/model/step2"],
+  "dense_weight_key": "model.layers.0.mlp.down_proj.weight",
+  "input_size": 128,
+  "output_size": 128,
+  "update_mode": "checkpoints"
+}
+```
+
+代码入口对应关系：
+
+| 测试位置 | 改造方式 |
+|---|---|
+| `_dense_payload(case, update)` | 根据 update 选择 checkpoint，读取配置中的 Dense 参数，替换其中的 `_actor_weight()` 调用 |
+| `_moe_payload(case, update)` | 读取选定 expert 的 gate/up/down 参数，组装 w13/w2 后送入 `_quantize()` |
+| 混合用例的 initial_bf16/updated_bf16 | 从配置指定的另一个 BF16 参数读取，并保持输入、输出维度匹配 |
+| `_actor_weight()` 生成的输入激活 | 保留确定性输入，以便比较不同权重版本 |
+
+仅替换权重来源，继续复用 `_quantize()`、restore、load、post-process 和 fresh-load
+对照逻辑。建议通过 fixture 显式传递配置及权重数据，不修改全局状态。
+
+### 14.2 按参数名读取 safetensors
+
+下面的辅助函数支持常见的单文件和分片 safetensors checkpoint，仅读取目标参数。
+需要测试环境安装 safetensors。此片段尚未集成进测试，也未经过 NPU 验证。
+
+```python
+import json
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+
+
+def read_weight(checkpoint_dir, key):
+    root = Path(checkpoint_dir)
+    index_path = root / "model.safetensors.index.json"
+    if index_path.exists():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_file = root / index["weight_map"][key]
+    else:
+        weight_file = root / "model.safetensors"
+    with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
+        tensor = handle.get_tensor(key)
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"Expected unquantized floating weights: {key}, {tensor.dtype}")
+    return tensor.to(torch.bfloat16).contiguous()
+```
+
+例如，将 `_dense_payload()` 的来源改为：
+
+```python
+source = read_weight(config["checkpoints"][update], config["dense_weight_key"])
+assert source.ndim == 2
+out_size, in_size = config["output_size"], config["input_size"]
+assert source.shape[0] >= out_size and source.shape[1] >= in_size
+weight = source[:out_size, :in_size].contiguous().to(DEVICE)
+quantized, scale = _quantize(weight, case)
+return {"weight": quantized, "weight_scale": scale}
+```
+
+保留当前脚本时，两个配置维度均应为 128。若使用完整层尺寸，必须同步改造
+`_make_dense_layer()`、输入激活和混合分支的维度；不能只改变 payload 的 shape。
+裁剪后的测试验证真实权重片段的更新，不能代表完整模型精度。
+
+### 14.3 MoE 权重映射
+
+配置中应为每个选定 expert 分别指定 gate_proj、up_proj、down_proj 的真实参数名。
+当前测试使用两个 expert；对于常见的独立 gate/up 格式，先确认模型采用 gate 在前、
+up 在后的顺序，再沿输出维拼接，最后沿 expert 维堆叠：
+
+- gate 和 up 各裁剪为 `[128, 128]`；拼接后单个 w13 为 `[256, 128]`。
+- down 裁剪为 `[128, 128]`，作为单个 w2。
+- 两个 expert 堆叠后，w13 为 `[2, 256, 128]`，w2 为 `[2, 128, 128]`。
+- W0/W1/W2 必须读取相同层、相同 expert、相同切片和相同拼接顺序。
+
+如果模型已经合并 gate/up、使用不同顺序或保存的是分片权重，应依据该模型的
+生产 loader 显式转换，不能直接套用上述映射。这里手动组装不等于验证模型 loader。
+
+### 14.4 一份权重和多份权重的选择
+
+- **多份 checkpoint：** checkpoints 依次提供 W0/W1/W2 的目录，直接测试真实训练
+  快照之间的更新；参数名和 shape 必须一致。
+- **只有一份 checkpoint：** 配置可扩展为 `update_mode: perturb`，增加固定 seed
+  和 perturbation amplitude，在 FP32 中对 W0 添加确定性扰动后转回 BF16，生成 W1/W2。
+  这验证更新机制，不证明真实优化器更新或训练导出正确。
+
+真实训练的微小更新可能没有改变量化后的 weight 或 scale。当前
+`_assert_payload_changed()` 要求两者都变化，这种情况下会失败，不能直接判为 reload
+错误。应挑选差异足够大的训练快照，或将真实快照模式改为记录 weight/scale 的实际变化，
+仅对确实变化的部分断言更新生效；两者都不变时明确报告该数据未覆盖有效 MX 更新。
+同理，输出变化断言需要确保所选输入能体现权重变化。保留人工生成的独立 weight/scale
+测试作为补充，不要求真实训练快照满足“仅一个字段变化”。
+
+### 14.5 已量化 checkpoint 的边界与验收
+
+本节读取函数用于未量化的 BF16/FP16/FP32 权重。已经量化的 MXFP8/MXFP4 checkpoint
+应直接读取匹配的 weight、scale 及 quant description，并验证 packing、dtype、分组大小
+和 checkpoint 布局，随后绕过 `_quantize()`。不能将打包字节转成 BF16 后再次量化。
+NVFP4 checkpoint 不属于这里的 Ascend MX 格式。
+
+运行时建议记录 checkpoint 路径、参数名、层/expert 编号、切片、更新模式及 payload
+变化情况，并保存 pytest 日志。验收仍要求热更新参数和输出匹配同一 payload 的全新加载
+结果；真实权重替换本身不会增加 HCCL、TP/EP 或完整模型精度的覆盖。
