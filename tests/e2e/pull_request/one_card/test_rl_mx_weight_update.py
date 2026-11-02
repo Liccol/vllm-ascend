@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -34,6 +35,13 @@ OUTPUT_SIZE = 128
 TOKENS = 8
 
 pytestmark = pytest.mark.skipif(torch.npu.device_count() < 1, reason="RL MX weight reload tests require one NPU")
+
+
+@pytest.fixture(autouse=True)
+def mx_config_context():
+    """Keep production configuration lookups valid throughout each test."""
+    with set_current_vllm_config(VllmConfig()):
+        yield
 
 
 @dataclass(frozen=True)
@@ -100,7 +108,7 @@ def _assert_same_tensor(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 def _load_parameter(parameter: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    """Use the same per-parameter loader selected by vLLM model loading."""
+    """Load unsharded layer parameters; model name/shard mapping is out of scope."""
     weight_loader = getattr(parameter, "weight_loader", default_weight_loader)
     weight_loader(parameter, loaded_weight)
 
@@ -315,33 +323,57 @@ def test_moe_mx_weights_match_fresh_load_across_two_rl_updates(case: MXCase):
     assert torch.isfinite(final_output).all()
 
 
+@pytest.mark.parametrize("case", MX_CASES, ids=lambda case: case.id)
+@pytest.mark.parametrize("changed_name", ("weight", "weight_scale"))
+def test_dense_independent_payload_update(case: MXCase, changed_name: str):
+    torch.npu.set_device(DEVICE)
+    method = _make_method(case.linear_cls)
+    original = _dense_payload(case, 0)
+    replacement = _dense_payload(case, 1)
+    _assert_payload_changed(original, replacement, ("weight",))
+    updated = {name: tensor.clone() for name, tensor in original.items()}
+    updated[changed_name] = replacement[changed_name].clone()
+    inputs = _actor_weight((TOKENS, HIDDEN_SIZE), 31)
+    live = _fresh_dense(method, original)
+    before = _dense_output(method, live, inputs).cpu()
+    _reload_dense(method, live, updated)
+    reference = _fresh_dense(method, updated)
+    for name in updated:
+        _assert_same_tensor(getattr(live, name), getattr(reference, name))
+    after = _dense_output(method, live, inputs).cpu()
+    torch.testing.assert_close(after, _dense_output(method, reference, inputs).cpu(), rtol=0, atol=0)
+    assert torch.isfinite(after).all()
+    assert not torch.equal(before, after)
+
+
 def test_mixed_mxfp8_and_bf16_weights_match_fresh_load():
     torch.npu.set_device(DEVICE)
     method = _make_method(w8a8_mxfp8.AscendW8A8MXFP8DynamicLinearMethod)
     inputs = _actor_weight((TOKENS, HIDDEN_SIZE), 51)
     initial_mx = _dense_payload(MX_CASES[0], 0)
-    updated_mx = _dense_payload(MX_CASES[0], 1)
     initial_bf16 = _actor_weight((OUTPUT_SIZE, HIDDEN_SIZE), 61)
-    updated_bf16 = _actor_weight((OUTPUT_SIZE, HIDDEN_SIZE), 62)
 
     live = _fresh_dense(method, initial_mx)
     live_residual = nn.Parameter(initial_bf16.clone(), requires_grad=False)
     initial_output = _dense_output(method, live, inputs) + F.linear(inputs, live_residual)
 
-    method.restore_weights_for_rl_loading(live)
-    _load_parameter(live.weight, updated_mx["weight"])
-    _load_parameter(live_residual, updated_bf16)
-    _load_parameter(live.weight_scale, updated_mx["weight_scale"])
-    method.process_weights_after_loading(live)
+    for update in (1, 2):
+        updated_mx = _dense_payload(MX_CASES[0], update)
+        updated_bf16 = _actor_weight((OUTPUT_SIZE, HIDDEN_SIZE), 61 + update)
+        method.restore_weights_for_rl_loading(live)
+        _load_parameter(live.weight, updated_mx["weight"])
+        _load_parameter(live_residual, updated_bf16)
+        _load_parameter(live.weight_scale, updated_mx["weight_scale"])
+        method.process_weights_after_loading(live)
 
-    reference = _fresh_dense(method, updated_mx)
-    reference_residual = nn.Parameter(updated_bf16.clone(), requires_grad=False)
-    hot_output = _dense_output(method, live, inputs) + F.linear(inputs, live_residual)
-    fresh_output = _dense_output(method, reference, inputs) + F.linear(inputs, reference_residual)
+        reference = _fresh_dense(method, updated_mx)
+        reference_residual = nn.Parameter(updated_bf16.clone(), requires_grad=False)
+        hot_output = _dense_output(method, live, inputs) + F.linear(inputs, live_residual)
+        fresh_output = _dense_output(method, reference, inputs) + F.linear(inputs, reference_residual)
 
-    _assert_same_tensor(live.weight, reference.weight)
-    _assert_same_tensor(live.weight_scale, reference.weight_scale)
-    _assert_same_tensor(live_residual, reference_residual)
-    torch.testing.assert_close(hot_output.cpu(), fresh_output.cpu(), rtol=0, atol=0)
-    assert not torch.equal(initial_output.cpu(), hot_output.cpu())
-    assert torch.isfinite(hot_output).all()
+        _assert_same_tensor(live.weight, reference.weight)
+        _assert_same_tensor(live.weight_scale, reference.weight_scale)
+        _assert_same_tensor(live_residual, reference_residual)
+        torch.testing.assert_close(hot_output.cpu(), fresh_output.cpu(), rtol=0, atol=0)
+        assert not torch.equal(initial_output.cpu(), hot_output.cpu())
+        assert torch.isfinite(hot_output).all()
