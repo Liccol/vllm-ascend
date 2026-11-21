@@ -20,6 +20,28 @@ The features described below are those enabled by the deployment commands in thi
 
 Refer to the [Supported Models](../../user_guide/support_matrix/supported_models.md) page for the support matrix and the [Feature Guide](../../user_guide/feature_guide/index.md) for feature configuration.
 
+### BF16 attention LoRA development validation
+
+This development branch adds Q/K/V LoRA to the fused QKV/indexer projection and
+uses the existing row-parallel implementation for O projection. The initial
+validation uses real BF16 weights reduced to four layers and two distinct,
+nonzero synthetic PEFT adapters. It covers eager TP2 + DP2 + EP execution and
+compares native output token IDs with merged-weight and serial-request references.
+The strict merged-reference token criterion is not yet satisfied. Service isolation
+passed with batch invariance enabled. These reduced-model results are not evidence
+of full-layer or trained-adapter quality acceptance.
+
+Enable LoRA with `--enable-lora --max-loras 2 --max-lora-rank 8 --lora-dtype bfloat16`
+and explicitly select `--lora-target-modules q_proj k_proj v_proj o_proj`.
+Use an unquantized BF16 checkpoint; `--dtype bfloat16` does not convert NVFP4 or
+W8A8 checkpoints. The quantized deployment commands below are separate scenarios.
+
+The initial test configuration disables sequence parallelism/FlashComm,
+speculative decoding and graph capture. Fully sharded, indexer, expert, MLP and
+vision adapters are outside this validation scope. See the repository's
+`tests/e2e/models/minimax_m31_lora/README.md` for asset preparation and reproduction,
+and `tests/e2e/models/minimax_m31_lora/RESULTS.md` for the passing and failing checks.
+
 ## 3 Prerequisites
 
 ### 3.1 Model Weight

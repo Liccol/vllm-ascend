@@ -16,6 +16,7 @@
 import vllm.lora.utils as lora_utils
 
 from vllm_ascend.lora.fused_moe import AscendFusedMoE3DWithLoRA, AscendFusedMoEWithLoRA
+from vllm_ascend.lora.minimax_m3 import AscendMiniMaxM3QKVParallelLinearWithLoRA
 from vllm_ascend.lora.utils import (
     AscendColumnParallelLinearWithLoRA,
     AscendMergedColumnParallelLinearWithLoRA,
@@ -33,6 +34,7 @@ def test_refresh_all_lora_classes_prepends_ascend_wrappers() -> None:
         refresh_all_lora_classes()
         classes = list(lora_utils._all_lora_classes)
         expected_prefix = [
+            AscendMiniMaxM3QKVParallelLinearWithLoRA,
             AscendRowParallelLinearWithLoRA,
             AscendColumnParallelLinearWithLoRA,
             AscendMergedColumnParallelLinearWithLoRA,
