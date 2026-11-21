@@ -4,7 +4,7 @@
 
 本目录验证 attention Q/K/V/O adapter。构造的 A/B 是两套独立、非零、固定 seed 的合成 PEFT 权重，初始化标准差为0.1，用于验证计算和服务链路，不代表经过微调的任务质量。
 
-本轮 [实测结果](RESULTS.md)：BI服务隔离通过，merged模型token全一致未通过；不能将本分支称为完整验收通过。
+本轮 [实测结果](RESULTS.md)：BI服务隔离通过，merged模型token全一致未通过；不能将本分支称为完整验收通过。后续 [逐层分歧定位](DIVERGENCE.md) 已复现失败，并完成独立 FP64 低秩与完整 merged GEMM 的因果对照。
 
 ## 1. 资产准备
 
