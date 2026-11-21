@@ -685,6 +685,7 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    lora_execution_mode: Literal["low_rank", "merged"] = "low_rank"
     shared_engram: SharedEngramConfig | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
@@ -904,6 +905,9 @@ class AscendConfig:
                 "Qwen3.5 family). Disabling."
             )
 
+        if self.lora_execution_mode == "merged":
+            self._validate_lora_execution_mode(vc, enable_sp(vllm_config=vc) or effective_flashcomm)
+
         # quantized_all_reduce_config and FlashComm1/SP are mutually exclusive:
         # SP replaces TP all-reduce with all-gather/reduce-scatter, so the
         # quantized all-reduce wrapper would never be invoked.
@@ -1098,6 +1102,26 @@ class AscendConfig:
         return bool(
             getattr(self, "enable_sparse_sfa_c8", False) or getattr(self, "enable_sparse_sfa_turboquant", False)
         )
+
+    def _validate_lora_execution_mode(self, vc: VllmConfig, sequence_parallel: bool) -> None:
+        if self.lora_execution_mode == "low_rank":
+            return
+        # Model-dependent dtype validation runs after configuration bootstrap.
+        import torch
+
+        model, lora = vc.model_config, vc.lora_config
+        architectures = getattr(getattr(model, "hf_config", None), "architectures", ()) or ()
+        supported = {"MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"}
+        if not supported.intersection(architectures):
+            raise ValueError("lora_execution_mode=merged currently supports MiniMax M3 only")
+        if lora is None or lora.fully_sharded_loras:
+            raise ValueError("lora_execution_mode=merged requires enabled, non-fully-sharded LoRA")
+        if not lora.target_modules or not set(lora.target_modules).issubset({"q_proj", "k_proj", "v_proj", "o_proj"}):
+            raise ValueError("lora_execution_mode=merged requires explicit attention Q/K/V/O target modules")
+        if model.dtype != torch.bfloat16 or not model.enforce_eager or sequence_parallel:
+            raise ValueError("lora_execution_mode=merged requires BF16, enforce_eager, and no sequence parallelism")
+        if model.enable_sleep_mode or vc.weight_transfer_config is not None:
+            raise ValueError("lora_execution_mode=merged does not support base weight switching or sleep mode")
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile

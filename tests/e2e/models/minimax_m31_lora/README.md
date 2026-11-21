@@ -4,7 +4,7 @@
 
 本目录验证 attention Q/K/V/O adapter。构造的 A/B 是两套独立、非零、固定 seed 的合成 PEFT 权重，初始化标准差为0.1，用于验证计算和服务链路，不代表经过微调的任务质量。
 
-本轮 [实测结果](RESULTS.md)：BI服务隔离通过，merged模型token全一致未通过；不能将本分支称为完整验收通过。后续 [逐层分歧定位](DIVERGENCE.md) 已复现失败，并完成独立 FP64 低秩与完整 merged GEMM 的因果对照。
+默认低秩模式的 [实测结果](RESULTS.md) 为模型3/8、BI服务隔离36/36。后续 [逐层分歧定位](DIVERGENCE.md) 与 [merged 模式实现及验收](MERGED_MODE.md) 分别记录数值原因和可选解决方案：正式 merged 模式在同拓扑模型对比8/8、混合服务36/36通过。范围仍是四层合成 adapter，跨 TP 和全层验收单列。
 
 ## 1. 资产准备
 
@@ -82,7 +82,7 @@ uv run --no-project python verify.py \
 
 trace 从 ready 后的客户端 marker 开始，排除 dummy warmup。还检查实际覆盖预期 DP rank，并要求已观察到的 workers 记录含 base/adapter1/adapter2 的同 batch token 映射。缺少证据也判失败，不能以并发 HTTP 200 代替实际混批。
 
-严格服务一致性应同时验证现有 batch-invariance 模式：在参考和 LoRA 服务启动前设置 `VLLM_BATCH_INVARIANT=1`，并增加 `--no-enable-chunked-prefill --block-size 128`。本轮该模式消除了服务混批分歧，但没有消除 merged 模型对照分歧；不能把模式开关当作模型验收保证。
+严格一致性测试在参考和 LoRA 服务启动前设置 `VLLM_BATCH_INVARIANT=1`，并增加 `--no-enable-chunked-prefill --block-size 128`。默认低秩路径仍有 merged 模型对照分歧；要复现本轮同拓扑8/8结果，还需增加 `--additional-config '{"lora_execution_mode":"merged"}'`。该模式的缓存成本、限制和实测见 [专项报告](MERGED_MODE.md)。
 
 运行前确保没有旧的 `.minimax-lora-trace.json` marker，trace 输出目录必须不存在。客户端正常或异常退出都会清理本轮 marker；若客户端被强杀，应手动删除该单个 marker 后再重跑。
 

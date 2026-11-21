@@ -37,6 +37,7 @@ The following table lists additional configuration options available in vLLM Asc
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
+| `lora_execution_mode`              | str | `"low_rank"` | `"merged"` caches BF16 merged attention target weights for MiniMax M3 LoRA. Requires eager execution and additional device memory; see below. |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `kv_trace`                  | dict | `{}`    | Per-engine KV cache address diagnostics for Model Runner V2. `enabled` defaults to `false`; `action` accepts `"log"` (default) or `"raise"`. See [KV Trace](../feature_guide/kv_trace.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for Ascend compilation                                                              |
@@ -77,6 +78,46 @@ The following table lists additional configuration options available in vLLM Asc
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
 
 The details of each configuration option are as follows:
+
+### LoRA execution mode
+
+`lora_execution_mode` defaults to `"low_rank"`, which uses the existing LoRA
+execution path. Select `"merged"` explicitly to cache BF16 weights using
+`BF16(FP32(W) + FP32(B) @ FP32(A))`, with the adapter scaling already applied
+by the upstream loader. This changes the numerical evaluation order to match a
+BF16 merged checkpoint. It is an alternative execution mode, with memory and
+compute costs, rather than an optimization of the low-rank kernel.
+
+```bash
+vllm serve /models/MiniMax-M3.1-Flash-BF16 \
+  --dtype bfloat16 --enforce-eager \
+  --enable-lora --lora-dtype bfloat16 --max-loras 2 \
+  --lora-target-modules q_proj k_proj v_proj o_proj \
+  --lora-modules task_a=/models/adapter-a task_b=/models/adapter-b \
+  --additional-config '{"lora_execution_mode":"merged"}'
+```
+
+Currently this mode supports MiniMax M3 attention Q/K/V/O targets with BF16 base
+and adapter weights. Explicit target modules are required. Fully sharded LoRA,
+sequence parallelism/FlashComm1, sleep mode, and base weight transfer are rejected.
+Graph execution is excluded by the eager requirement. Expert, MLP, and visual
+adapters are outside this mode's supported target set.
+
+Each configured device slot reserves a full local copy of every wrapped target
+weight before memory profiling, including the indexer tail of fused QKV weights.
+The additional logical cache size per worker is
+`max_loras * sum(local_target_weight.numel() * 2)` bytes, besides the ordinary
+LoRA A/B buffers. Reset invalidates the cached slot without freeing its storage;
+reload rebuilds it from the original base weight. Adapter activation performs
+CPU FP32 matrix multiplication and device copies. Forward computes the base
+projection and an additional full projection for each enabled cached slot, then
+selects rows using the existing token-to-slot mapping. Latency and throughput
+need separate qualification.
+
+Strict token comparisons also require consistent batching and parallel topology.
+See the [MiniMax M3.1 LoRA validation](../../tutorials/models/MiniMax-M3.1-Flash.md#bf16-attention-lora-development-validation)
+for the tested scope and batch-invariance settings. This option does not promise
+bitwise equality for every prompt or across different TP sizes.
 
 <span id="runtime_guard"></span>**runtime_guard**
 

@@ -24,6 +24,10 @@ from vllm_ascend.lora.fused_moe import (
     AscendFusedMoEWithLoRA,
 )
 from vllm_ascend.lora.minimax_m3 import AscendMiniMaxM3QKVParallelLinearWithLoRA
+from vllm_ascend.lora.minimax_m3_merged import (
+    AscendMiniMaxM3MergedQKVWithLoRA,
+    AscendMiniMaxM3MergedRowWithLoRA,
+)
 from vllm_ascend.ops.linear import AscendQKVParallelLinear
 
 
@@ -202,6 +206,8 @@ class AscendColumnParallelLinearWithLoRA(_SingleLinearLoRAWrapper, ColumnParalle
 
 def refresh_all_lora_classes():
     ascend_classes = (
+        AscendMiniMaxM3MergedQKVWithLoRA,
+        AscendMiniMaxM3MergedRowWithLoRA,
         AscendMiniMaxM3QKVParallelLinearWithLoRA,
         AscendRowParallelLinearWithLoRA,
         AscendColumnParallelLinearWithLoRA,

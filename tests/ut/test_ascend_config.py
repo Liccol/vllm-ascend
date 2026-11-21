@@ -26,6 +26,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+import pytest
+import torch
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -57,6 +59,53 @@ from vllm_ascend.ascend_config import (
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("architectures", ["Qwen3ForCausalLM"], "MiniMax M3 only"),
+        ("fully_sharded_loras", True, "non-fully-sharded"),
+        ("lora_config", None, "enabled"),
+        ("target_modules", None, "explicit attention"),
+        ("target_modules", {"gate_proj"}, "explicit attention"),
+        ("dtype", torch.float16, "BF16"),
+        ("enforce_eager", False, "enforce_eager"),
+        ("sequence_parallel", True, "sequence parallelism"),
+        ("enable_sleep_mode", True, "sleep mode"),
+        ("weight_transfer_config", object(), "weight switching"),
+    ],
+)
+def test_merged_lora_rejects_unsupported_execution(field, value, error):
+    config = AscendConfig(lora_execution_mode="merged", sparse_kv_offload_config=SparseKVOffloadConfig())
+    model = SimpleNamespace(
+        dtype=torch.bfloat16,
+        enforce_eager=True,
+        enable_sleep_mode=False,
+        hf_config=SimpleNamespace(architectures=["MiniMaxM3SparseForConditionalGeneration"]),
+    )
+    lora = SimpleNamespace(fully_sharded_loras=False, target_modules={"q_proj", "k_proj", "v_proj", "o_proj"})
+    vc = SimpleNamespace(model_config=model, lora_config=lora, weight_transfer_config=None)
+    config._validate_lora_execution_mode(vc, False)
+    if field == "architectures":
+        model.hf_config.architectures = value
+    elif field in ("fully_sharded_loras", "target_modules"):
+        setattr(lora, field, value)
+    elif field in ("weight_transfer_config", "lora_config"):
+        setattr(vc, field, value)
+    elif field != "sequence_parallel":
+        setattr(model, field, value)
+    with pytest.raises(ValueError, match=error):
+        config._validate_lora_execution_mode(vc, field == "sequence_parallel")
+
+
+def test_lora_execution_mode_rejects_invalid_values():
+    for value in ("unknown", True, 1):
+        with pytest.raises(ValueError, match="lora_execution_mode"):
+            AscendConfig(lora_execution_mode=value, sparse_kv_offload_config=SparseKVOffloadConfig())
+    AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())._validate_lora_execution_mode(
+        SimpleNamespace(), False
+    )
 
 
 def test_shared_engram_requires_v2_runner():
@@ -2157,6 +2206,20 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
             self.assertEqual(vc.parallel_config.all2all_backend, "flashinfer_all2allv")
             self.assertFalse(enable_sp(vc))
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_merged_lora_validation_uses_effective_sp_after_flashcomm_selection(self, mock_fix):
+        with patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "0"}):
+            vc = VllmConfig()
+            vc.parallel_config.enable_expert_parallel = True
+            vc.parallel_config.tensor_parallel_size = 2
+            vc.parallel_config.data_parallel_size = 2
+            vc.parallel_config.all2all_backend = "allgather_reducescatter"
+            vc.additional_config = {"lora_execution_mode": "merged"}
+            with patch.object(AscendConfig, "_validate_lora_execution_mode") as validate_lora:
+                init_ascend_config(vc)
+            validate_lora.assert_called_once_with(vc, False)
 
     @_clean_up
     @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)

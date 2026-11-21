@@ -27,14 +27,26 @@ uses the existing row-parallel implementation for O projection. The initial
 validation uses real BF16 weights reduced to four layers and two distinct,
 nonzero synthetic PEFT adapters. It covers eager TP2 + DP2 + EP execution and
 compares native output token IDs with merged-weight and serial-request references.
-The strict merged-reference token criterion is not yet satisfied. Service isolation
-passed with batch invariance enabled. These reduced-model results are not evidence
-of full-layer or trained-adapter quality acceptance.
+The default low-rank mode passed service isolation with batch invariance enabled,
+but matched only 3/8 merged-reference sequences. The optional merged execution mode
+matched 8/8 sequences against same-topology merged references and 36/36 mixed-request
+comparisons. These reduced-model results are not evidence of full-layer or
+trained-adapter quality acceptance, or equality across different TP sizes.
 
 Enable LoRA with `--enable-lora --max-loras 2 --max-lora-rank 8 --lora-dtype bfloat16`
 and explicitly select `--lora-target-modules q_proj k_proj v_proj o_proj`.
 Use an unquantized BF16 checkpoint; `--dtype bfloat16` does not convert NVFP4 or
 W8A8 checkpoints. The quantized deployment commands below are separate scenarios.
+
+To select the alternative execution mode, add
+`--additional-config '{"lora_execution_mode":"merged"}'` and `--enforce-eager`.
+It caches full local target weights per device slot and adds full projections
+per enabled slot during forward. See [LoRA execution mode](../../user_guide/configuration/additional_config.md#lora-execution-mode)
+for the memory formula and restrictions. This is a memory/compute trade-off to
+change BF16 evaluation order, not a low-rank kernel precision fix.
+
+The strict comparison additionally used `VLLM_BATCH_INVARIANT=1`,
+`--no-enable-chunked-prefill --block-size 128` on reference and LoRA servers.
 
 The initial test configuration disables sequence parallelism/FlashComm,
 speculative decoding and graph capture. Fully sharded, indexer, expert, MLP and
