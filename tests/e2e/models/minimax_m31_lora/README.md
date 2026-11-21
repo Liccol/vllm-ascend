@@ -6,6 +6,8 @@
 
 默认低秩模式的 [实测结果](RESULTS.md) 为模型3/8、BI服务隔离36/36。后续 [逐层分歧定位](DIVERGENCE.md) 与 [merged 模式实现及验收](MERGED_MODE.md) 分别记录数值原因和可选解决方案：正式 merged 模式在同拓扑模型对比8/8、混合服务36/36通过。范围仍是四层合成 adapter，跨 TP 和全层验收单列。
 
+当前按要求采用标准低秩继续定位，见 [标准低秩与跨 TP 对照](STANDARD_LOW_RANK.md)。两种精度控制均未达到原硬指标，未修改生产执行路径；不能把历史 merged 模式的通过结果计入标准低秩验收。
+
 ## 1. 资产准备
 
 固定 vLLM `c410543d9ffff03f5f6c4a8c0ae1d3ad082c4a15` 与 Ascend 基线 `7a7ed073c481d5e3a2fc2194c5b879efb2d373c0`，安装本分支代码。确认 import 路径与预期源码一致。
