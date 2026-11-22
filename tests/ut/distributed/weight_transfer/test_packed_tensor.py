@@ -26,6 +26,7 @@ data correctness is verified end-to-end.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 import weakref
 from contextlib import contextmanager
@@ -1392,7 +1393,10 @@ def test_hccl_packed_group_tracks_only_registered_streams():
     assert transport.buffers[0].numel() == 0
 
     outsider = _FakeNpuStream()
-    with patch.object(torch.npu, "current_stream", return_value=outsider), pytest.raises(ValueError):
+    with (
+        patch.object(torch.npu, "current_stream", return_value=outsider),
+        pytest.raises(RuntimeError, match="packed stream cache changed"),
+    ):
         transport.broadcast(torch.zeros(1, dtype=torch.uint8), src=0)
 
 
@@ -1475,3 +1479,167 @@ def test_hccl_group_prewarms_the_upstream_stream_cache_with_its_own_key():
         assert upstream._get_streams.cache_info().currsize == 1
     finally:
         upstream._get_streams.cache_clear()
+
+
+@pytest.mark.parametrize("num_buffers", [1, 2])
+def test_layer_spanning_chunks_waits_for_earlier_clone(num_buffers):
+    """A later slot may finish reading while the earlier clone is still queued."""
+
+    class QueuedStream(_FakeNpuStream):
+        def __init__(self):
+            self.tasks = []
+
+        def synchronize(self):
+            while self.tasks:
+                self.tasks.pop(0)()
+
+        def wait_event(self, event):
+            self.tasks.append(event.synchronize)
+
+    class Event:
+        def record(self, stream):
+            self.tasks = list(stream.tasks)
+
+        def synchronize(self):
+            for task in self.tasks:
+                task()
+
+    streams = [QueuedStream() for _ in range(num_buffers)]
+    inputs = iter([torch.tensor([1.0, 2.0]), torch.tensor([3.0])])
+    retained = []
+    output = torch.zeros(3)
+
+    def clone(raw, *args, **kwargs):
+        result = torch.zeros_like(raw)
+        torch.npu.current_stream().tasks.append(lambda: result.copy_(raw))
+        return result
+
+    def receive(packed, **kwargs):
+        packed.copy_(next(inputs).view(torch.uint8))
+
+    def load(weights):
+        retained.extend(tensor for _, tensor in weights)
+        if len(retained) == 3:
+            reader = torch.npu.current_stream()
+            reader.tasks.append(lambda: output.copy_(torch.cat(retained)))
+            # Force a legal schedule: the reader finishes before the other
+            # slot's final drain. A correct dependency must make its inputs ready.
+            reader.synchronize()
+
+    with (
+        patch.object(torch.npu, "Stream", side_effect=streams),
+        patch.object(torch.npu, "Event", Event),
+        patch.object(torch, "Event", Event),
+        patch.object(torch.Tensor, "clone", clone),
+    ):
+        packed_broadcast_consumer(
+            iter((f"layer.w{i}", ([1], torch.float32)) for i in range(3)),
+            types.SimpleNamespace(broadcast=receive),
+            0,
+            load,
+            4,
+            num_buffers,
+        )
+    assert torch.equal(output, torch.tensor([1.0, 2.0, 3.0])), output
+
+
+@pytest.mark.parametrize("producer", [False, True])
+def test_upstream_stream_cache_drift_fails_before_collective(producer):
+    """A changed cache contract must not submit HCCL on an unregistered stream."""
+    from vllm.distributed.weight_transfer import packed_tensor as upstream
+
+    group = _make_group_mock()
+    with (
+        patch.object(
+            upstream, "_get_streams", side_effect=lambda device, count: tuple(_FakeNpuStream() for _ in range(count))
+        ),
+        pytest.raises(RuntimeError, match="packed stream cache changed"),
+    ):
+        if producer:
+            packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 8, 2)
+        else:
+            packed_broadcast_consumer(iter([("w", ([1], torch.float32))]), group, 0, lambda weights: None, 8, 2)
+    group.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("producer", [False, True], ids=["consumer", "producer"])
+def test_concurrent_hccl_transfer_is_rejected_before_collective(producer):
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def hold_broadcast(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def active_transfer():
+        try:
+            packed_broadcast_producer(
+                iter([("active", torch.ones(1))]),
+                types.SimpleNamespace(broadcast=hold_broadcast),
+                0,
+                lambda item: item[1],
+                8,
+                1,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    group = _make_group_mock()
+
+    def second_transfer():
+        # A different slot count must not bypass the device-level guard.
+        if producer:
+            packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 8, 2)
+        else:
+            group.broadcast.side_effect = lambda tensor, **kwargs: tensor.fill_(0)
+            packed_broadcast_consumer(iter([("w", ([1], torch.float32))]), group, 0, lambda weights: None, 8, 2)
+
+    thread = threading.Thread(target=active_transfer, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="must be serialized across communicators"):
+            second_transfer()
+        group.broadcast.assert_not_called()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors
+    second_transfer()
+    group.broadcast.assert_called_once()
+
+
+def test_hccl_transfer_guard_is_scoped_to_device_and_released_on_error():
+    import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
+
+    with packed_module._hccl_group(_make_group_mock(), 1):
+        with patch.object(torch.accelerator, "current_device_index", return_value=1):
+            with (
+                pytest.raises(RuntimeError, match="loader failed"),
+                packed_module._hccl_group(_make_group_mock(), 2),
+            ):
+                raise RuntimeError("loader failed")
+            with packed_module._hccl_group(_make_group_mock(), 1):
+                pass
+        with (
+            pytest.raises(RuntimeError, match="must be serialized"),
+            packed_module._hccl_group(_make_group_mock(), 1),
+        ):
+            pass
+
+
+@pytest.mark.parametrize("change", ["missing", "signature", "count"])
+def test_incompatible_upstream_stream_api_fails_before_collective(monkeypatch, change):
+    from vllm.distributed.weight_transfer import packed_tensor as upstream
+
+    if change == "missing":
+        monkeypatch.delattr(upstream, "_get_streams")
+    elif change == "signature":
+        monkeypatch.setattr(upstream, "_get_streams", lambda device: ())
+    else:
+        monkeypatch.setattr(upstream, "_get_streams", lambda device, count: ())
+    group = _make_group_mock()
+    with pytest.raises(RuntimeError, match="Incompatible vLLM packed stream"):
+        packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 8, 2)
+    group.broadcast.assert_not_called()

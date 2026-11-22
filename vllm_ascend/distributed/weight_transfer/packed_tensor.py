@@ -5,6 +5,7 @@
 import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from threading import Lock
 from typing import Any
 
 import torch
@@ -15,6 +16,38 @@ from vllm.logger import logger
 
 DEFAULT_PACKED_BUFFER_SIZE_BYTES = upstream.DEFAULT_PACKED_BUFFER_SIZE_BYTES
 DEFAULT_PACKED_NUM_BUFFERS = upstream.DEFAULT_PACKED_NUM_BUFFERS
+
+# The upstream stream cache is shared by all communicators on a device.
+# Track active transfers for their entire lifetime, including failure cleanup.
+_HCCL_TRANSFER_LOCK = Lock()
+_ACTIVE_HCCL_DEVICES: set[int] = set()
+
+
+@contextmanager
+def _serialized_hccl_transfer(device_idx: int):
+    with _HCCL_TRANSFER_LOCK:
+        if device_idx in _ACTIVE_HCCL_DEVICES:
+            raise RuntimeError(
+                f"Packed HCCL transfers on npu:{device_idx} must be serialized across communicators; "
+                "wait for the active transfer to finish on every rank before starting another"
+            )
+        _ACTIVE_HCCL_DEVICES.add(device_idx)
+    try:
+        yield
+    finally:
+        with _HCCL_TRANSFER_LOCK:
+            _ACTIVE_HCCL_DEVICES.remove(device_idx)
+
+
+def _get_hccl_streams(device_idx: int, num_buffers: int) -> list[Any]:
+    """Keep the private vLLM stream-cache dependency at one compatibility boundary."""
+    try:
+        streams = list(upstream._get_streams(device_idx, num_buffers))
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError("Incompatible vLLM packed stream API; check the supported vLLM pairing") from exc
+    if len(streams) != num_buffers:
+        raise RuntimeError("Incompatible vLLM packed stream count; check the supported vLLM pairing")
+    return streams
 
 
 # On a failed stream drain, keep storage alive until process exit. Its async
@@ -69,7 +102,11 @@ class _HCCLPackedGroup:
 
     def broadcast(self, tensor, src):
         stream = torch.npu.current_stream()
-        self.buffers[self.streams.index(stream)] = tensor
+        try:
+            index = self.streams.index(stream)
+        except ValueError as exc:
+            raise RuntimeError("vLLM packed stream cache changed; check the supported vLLM pairing") from exc
+        self.buffers[index] = tensor
         # Flush packing work before native HCCL. Packing on another slot can
         # overlap the previous transfer, but collectives must not overlap.
         stream.synchronize()
@@ -88,13 +125,14 @@ def _hccl_group(group, num_buffers, *, is_producer=False):
     # Standalone trainers need the same NPU-only API adaptation as V2 workers.
     from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
-    with torch_cuda_wrapper():
+    device_idx = torch.accelerator.current_device_index()
+    with _serialized_hccl_transfer(device_idx), torch_cuda_wrapper():
         # Match upstream's cache key exactly: _get_streams is @cache'd on
         # (device_idx, num_buffers) and both upstream loops resolve the index
         # via torch.accelerator. A divergent key would silently fork the
         # stream cache and leave the per-slot registration below pointing at
         # streams the loop never uses.
-        streams = list(upstream._get_streams(torch.accelerator.current_device_index(), num_buffers))
+        streams = _get_hccl_streams(device_idx, num_buffers)
         transport = _HCCLPackedGroup(group, streams, is_producer=is_producer)
         error = None
         try:
@@ -133,7 +171,7 @@ def packed_broadcast_producer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
-    """Delegate packing, slot rotation and normal cleanup to vLLM."""
+    """Delegate packing to vLLM; transfers must be serialized per device on every rank."""
     if buffer_size_bytes <= 0 or num_buffers <= 0:
         raise ValueError("buffer_size_bytes and num_buffers must be positive")
     with _hccl_group(group, num_buffers, is_producer=True) as transport:
@@ -150,7 +188,12 @@ def packed_broadcast_consumer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
-    """Delegate receive, unpack and callback ordering to the installed vLLM."""
+    """Reuse vLLM receive/unpack with ordered owning callbacks.
+
+    Transfers must be serialized per device on every rank. Callbacks may retain
+    weights for later slot callbacks; additional reader streams must arrange
+    their own readiness dependencies and storage lifetime tracking.
+    """
     if buffer_size_bytes <= 0 or num_buffers <= 0:
         raise ValueError("buffer_size_bytes and num_buffers must be positive")
 
@@ -159,23 +202,22 @@ def packed_broadcast_consumer(
     # unaligned offsets (e.g. int64 landing at byte 6 after 3 bf16 elements).
     # owning() clones each byte slice and restores the real dtype/shape.
     expected: list[tuple[list[int], torch.dtype]] = []
+    previous_load: Any = None
 
     def owning(tensors: list[tuple[str, torch.Tensor]]) -> None:
-        """Give the engine's loader independent storage for each unpacked tensor.
-
-        Upstream allocates a receive buffer for each chunk and passes byte
-        views into it. Cloning preserves the pre-refactor Ascend consumer's
-        independent-storage contract without rebinding any vLLM module
-        attribute. Cloning bytes before restoring the dtype also supports
-        unaligned mixed-dtype chunks that upstream's in-place view(dtype)
-        cannot handle. The clone is enqueued on the receive stream;
-        upstream's ready events and record_stream protect the original
-        packed buffer, not these new clones. Clone readiness and lifetime
-        on other reader streams remain open items (design doc section 5.1).
-        """
+        """Restore aligned, independent storage and order cross-slot loader reads."""
+        nonlocal previous_load
+        stream = torch.npu.current_stream()
+        if previous_load is not None:
+            stream.wait_event(previous_load)
         restored = []
         for (name, raw), (shape, dtype) in zip(tensors, expected):
-            restored.append((name, raw.clone().view(dtype).reshape(shape)))
+            tensor = raw.clone().view(dtype).reshape(shape)
+            # Upstream tracks the receive buffer, but these owning allocations
+            # can outlive this callback and be read on later slot streams.
+            for reader in reader_streams:
+                tensor.record_stream(reader)
+            restored.append((name, tensor))
         del expected[: len(tensors)]
         try:
             post_unpack_func(restored)
@@ -183,6 +225,8 @@ def packed_broadcast_consumer(
             # Upstream catches StopIteration around receive_and_load as well
             # as metadata iteration. A loader failure must not retry a receive.
             raise RuntimeError("post_unpack_func raised StopIteration") from exc
+        previous_load = torch.npu.Event()
+        previous_load.record(stream)
 
     def metadata():
         for name, (shape, dtype) in iterator:
@@ -192,6 +236,7 @@ def packed_broadcast_consumer(
             yield name, ([math.prod(shape) * dtype.itemsize], torch.uint8)
 
     with _hccl_group(group, num_buffers) as transport:
+        reader_streams = [*transport.streams, torch.npu.current_stream()]
         upstream.packed_nccl_broadcast_consumer(
             metadata(),
             transport,
