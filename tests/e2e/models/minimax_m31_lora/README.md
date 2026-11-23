@@ -8,6 +8,8 @@
 
 当前按要求采用标准低秩继续定位，见 [标准低秩与跨 TP 对照](STANDARD_LOW_RANK.md)。两种精度控制均未达到原硬指标，未修改生产执行路径；不能把历史 merged 模式的通过结果计入标准低秩验收。
 
+2026-11-23 新增 [MindSpeed-Agent 参考协议用例](REFERENCE_VALIDATION.md)：独立 FP64/HF 参考、Q/K/V隔离、zero及加载生命周期。24次实机请求完成，逐层424/576通过，状态PARTIAL；保留上面的多卡严格测试结论。
+
 ## 1. 资产准备
 
 固定 vLLM `c410543d9ffff03f5f6c4a8c0ae1d3ad082c4a15` 与 Ascend 基线 `7a7ed073c481d5e3a2fc2194c5b879efb2d373c0`，安装本分支代码。确认 import 路径与预期源码一致。
