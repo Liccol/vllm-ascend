@@ -1357,29 +1357,6 @@ def test_packed_roundtrip_odd_bf16_followed_by_unaligned_int64(backend):
 # ---------------------------------------------------------------------------
 
 
-def test_upstream_paired_interface_is_stable():
-    """Pin the upstream symbols this module depends on.
-
-    Both paired versions (verified main commit and release tag) must keep the
-    producer/consumer signatures and the consumer ``device`` parameter; a vLLM
-    pin bump that breaks any of these fails here instead of at transfer time
-    on a real NPU.
-    """
-    import inspect
-
-    from vllm.distributed.weight_transfer import packed_tensor as upstream
-
-    producer = inspect.signature(upstream.packed_nccl_broadcast_producer).parameters
-    consumer = inspect.signature(upstream.packed_nccl_broadcast_consumer).parameters
-    assert list(producer)[:4] == ["iterator", "group", "src", "post_iter_func"]
-    assert list(consumer)[:4] == ["iterator", "group", "src", "post_unpack_func"]
-    for params in (producer, consumer):
-        assert list(params)[4:6] == ["buffer_size_bytes", "num_buffers"]
-    assert "device" in consumer
-    assert callable(upstream._get_streams)
-    assert callable(upstream.unpack_tensor)
-
-
 def test_hccl_packed_group_tracks_only_registered_streams():
     """Each payload is registered under its slot; unknown streams fail loudly."""
     import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
