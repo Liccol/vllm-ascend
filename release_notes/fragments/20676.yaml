@@ -1,8 +1,0 @@
-pr: 20676
-entries:
-  - category: bugfix
-    text: >-
-      Fixed incorrect weights when packed HCCL updates load a layer spanning
-      multiple chunks on different NPU streams. Overlapping packed HCCL updates
-      on the same device are now rejected; callers must finish each update on
-      all ranks before starting another, including with different communicators.
