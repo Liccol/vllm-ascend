@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reuse vLLM HCCL packed loops; retain the local NPU IPC implementation."""
+"""Packed tensor utilities for efficient weight transfer."""
 
 import math
 from collections.abc import Callable, Iterator
@@ -127,11 +127,7 @@ def _hccl_group(group, num_buffers, *, is_producer=False):
 
     device_idx = torch.accelerator.current_device_index()
     with _serialized_hccl_transfer(device_idx), torch_cuda_wrapper():
-        # Match upstream's cache key exactly: _get_streams is @cache'd on
-        # (device_idx, num_buffers) and both upstream loops resolve the index
-        # via torch.accelerator. A divergent key would silently fork the
-        # stream cache and leave the per-slot registration below pointing at
-        # streams the loop never uses.
+        # Use the same accelerator index/cache key as the upstream loops.
         streams = _get_hccl_streams(device_idx, num_buffers)
         transport = _HCCLPackedGroup(group, streams, is_producer=is_producer)
         error = None
@@ -171,9 +167,31 @@ def packed_broadcast_producer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
-    """Delegate packing to vLLM; transfers must be serialized per device on every rank."""
+    """Broadcast tensors in a packed manner from trainer to workers.
+
+    Transfers must be serialized per device on every rank.
+
+    Args:
+        iterator: Iterator of model parameters. Returns a tuple of (name, tensor)
+        group: Process group (PyHcclCommunicator)
+        src: Source rank (0 in current implementation)
+        post_iter_func: Function to apply to each (name, tensor) pair before
+                       packing. Must return a Tensor with the source dtype and
+                       element count, or raises ValueError. Flattened element
+                       positions must still match the source metadata: values,
+                       device and strides may change, but elements must not be
+                       reordered (e.g. by transposing). Order is a caller contract,
+                       not checked here.
+        buffer_size_bytes: Size in bytes for each packed tensor buffer.
+                          Both producer and consumer must use the same value.
+        num_buffers: Number of buffers for double/triple buffering.
+                    Both producer and consumer must use the same value.
+    """
     if buffer_size_bytes <= 0 or num_buffers <= 0:
-        raise ValueError("buffer_size_bytes and num_buffers must be positive")
+        raise ValueError(
+            f"buffer_size_bytes and num_buffers must be positive, got "
+            f"buffer_size_bytes={buffer_size_bytes}, num_buffers={num_buffers}"
+        )
     with _hccl_group(group, num_buffers, is_producer=True) as transport:
         upstream.packed_nccl_broadcast_producer(
             iterator, transport, src, _checked_callback(post_iter_func), buffer_size_bytes, num_buffers
@@ -188,14 +206,32 @@ def packed_broadcast_consumer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
 ) -> None:
-    """Reuse vLLM receive/unpack with ordered owning callbacks.
+    """Consume packed tensors and unpack them into a list of tensors.
 
-    Transfers must be serialized per device on every rank. Callbacks may retain
-    weights for later slot callbacks; additional reader streams must arrange
-    their own readiness dependencies and storage lifetime tracking.
+    Unpacking clones one actual chunk's payload in addition to the receive
+    buffer and loader copies. A HCCL chunk may exceed buffer_size_bytes; peak
+    memory also depends on in-flight slots and tensors retained by the loader.
+
+    Transfers must be serialized per device on every rank.
+    Additional reader streams must arrange their own readiness and storage tracking.
+
+    Args:
+        iterator: Iterator of parameter metadata. Returns (name, (shape, dtype))
+        group: Process group (PyHcclCommunicator)
+        src: Source rank (0 in current implementation)
+        post_unpack_func: Function to apply to each list of (name, tensor) after
+                         unpacking. Tensors own independent storage and may be
+                         retained or modified without aliasing the packed buffer.
+        buffer_size_bytes: Size in bytes for each packed tensor buffer.
+                          Both producer and consumer must use the same value.
+        num_buffers: Number of buffers for double/triple buffering.
+                    Both producer and consumer must use the same value.
     """
     if buffer_size_bytes <= 0 or num_buffers <= 0:
-        raise ValueError("buffer_size_bytes and num_buffers must be positive")
+        raise ValueError(
+            f"buffer_size_bytes and num_buffers must be positive, got "
+            f"buffer_size_bytes={buffer_size_bytes}, num_buffers={num_buffers}"
+        )
 
     # Metadata is flattened to uint8 bytes so upstream's unpack_tensor only
     # ever views itemsize-1 data: its in-place view(dtype) raises for
@@ -414,11 +450,12 @@ def packed_npu_ipc_consumer(
         raise ValueError(f"packed IPC metadata declares {content_size} bytes, buffer has {packed.numel()}")
     packed = packed[:content_size]
 
-    # The producer reuses one IPC buffer across chunks, so clone every byte
-    # slice into independent storage before reinterpreting the dtype. Cloning
-    # first keeps unaligned mixed-dtype layouts working; upstream's
-    # unpack_tensor views the raw slice in place and raises for them.
-    return [
-        (name, raw.clone().view(dtype).reshape(shape))
-        for name, shape, dtype, raw in zip(names, shapes, dtypes, packed.split(tensor_sizes))
-    ]
+    weights: list[tuple[str, torch.Tensor]] = []
+    offset = 0
+    for name, shape, dtype, size in zip(names, shapes, dtypes, tensor_sizes):
+        raw = packed[offset : offset + size]
+        tensor = raw.clone().view(dtype).reshape(shape)
+        weights.append((name, tensor))
+        offset += size
+
+    return weights

@@ -17,59 +17,12 @@ _RETAINED_WEIGHT_ELEMENTS = 128 * 1024
 _ALLOCATOR_REUSE_ATTEMPTS = 64
 
 
-@pytest.mark.parametrize("num_buffers", [1, 2])
-def test_layer_spanning_chunks_reads_completed_clones(num_buffers):
-    torch.npu.set_device(0)
-    expected = torch.tensor([1.0, 2.0], device="npu")
-    payloads = iter(expected.split(1))
-    output = torch.zeros_like(expected)
-    torch.npu.synchronize()
-    retained = []
-    ready = torch.npu.Event()
-    clone_count = 0
-    original_clone = torch.Tensor.clone
-    matrix = torch.ones((_DELAY_MATRIX_SIZE, _DELAY_MATRIX_SIZE), device="npu", dtype=torch.float16)
-    scratch = torch.empty_like(matrix)
-    torch.mm(matrix, matrix, out=scratch)
-    torch.npu.synchronize()
-
-    def delayed_clone(raw, *args, **kwargs):
-        nonlocal clone_count
-        clone_count += 1
-        if clone_count != 1:
-            return original_clone(raw, *args, **kwargs)
-        result = torch.zeros_like(raw)
-        torch.npu.current_stream().synchronize()
-        for _ in range(_DELAY_MATMUL_COUNT):
-            torch.mm(matrix, matrix, out=scratch)
-        result.copy_(raw)
-        ready.record(torch.npu.current_stream())
-        return result
-
-    def receive(buffer, **kwargs):
-        buffer.copy_(next(payloads).view(torch.uint8))
-
-    def load(weights):
-        retained.extend(tensor for _, tensor in weights)
-        if len(retained) == 2:
-            print(f"num_buffers={num_buffers}, clone_pending_at_load={not ready.query()}", flush=True)
-            output.copy_(torch.cat(retained))
-            torch.npu.current_stream().synchronize()
-
-    with patch.object(torch.Tensor, "clone", delayed_clone):
-        packed_broadcast_consumer(
-            iter((f"layer.w{i}", ([1], torch.float32)) for i in range(2)),
-            SimpleNamespace(broadcast=receive),
-            0,
-            load,
-            1,
-            num_buffers,
-        )
-    torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=0, atol=0)
-
-
-def test_layer_clone_survives_async_reader_after_loader_releases_it():
-    """Separate allocation lifetime from readiness by completing the first clone."""
+@pytest.mark.parametrize(
+    "lifetime_only,num_buffers",
+    [(False, 1), (False, 2), (True, 2)],
+    ids=["ready-single-slot", "ready-cross-slot", "lifetime-cross-slot"],
+)
+def test_retained_layer_clone_is_ready_and_alive(lifetime_only, num_buffers):
     torch.npu.set_device(0)
     expected = torch.arange(_RETAINED_WEIGHT_ELEMENTS, dtype=torch.float32, device="npu") + 1
     payloads = iter([expected, torch.ones(1, device="npu")])
@@ -78,46 +31,58 @@ def test_layer_clone_survives_async_reader_after_loader_releases_it():
     scratch = torch.empty_like(matrix)
     torch.mm(matrix, matrix, out=scratch)
     torch.npu.synchronize()
-    retained = []
+    retained, poison = [], []
     origin = None
-    released_pointer = None
-    poison = []
+    first_clone = True
+    original_clone = torch.Tensor.clone
+
+    def delay():
+        for _ in range(_DELAY_MATMUL_COUNT):
+            torch.mm(matrix, matrix, out=scratch)
+
+    def clone(raw, *args, **kwargs):
+        nonlocal first_clone
+        if lifetime_only or not first_clone:
+            return original_clone(raw, *args, **kwargs)
+        first_clone = False
+        result = torch.zeros_like(raw)
+        torch.npu.current_stream().synchronize()
+        delay()
+        result.copy_(raw)
+        return result
 
     def receive(buffer, **kwargs):
         buffer.copy_(next(payloads).view(torch.uint8))
 
     def load(weights):
-        nonlocal origin, released_pointer
+        nonlocal origin
         if origin is None:
             retained.extend(tensor for _, tensor in weights)
             origin = torch.npu.current_stream()
             return
-        # Make input readiness explicit so only allocator lifetime is tested.
-        origin.synchronize()
         first = retained.pop()
-        released_pointer = first.untyped_storage().data_ptr()
-        reader = torch.npu.current_stream()
-        for _ in range(_DELAY_MATMUL_COUNT):
-            torch.mm(matrix, matrix, out=scratch)
+        if lifetime_only:
+            # Complete the clone so this variant isolates allocator lifetime.
+            origin.synchronize()
+            delay()
         output.copy_(first)
         del first
-        reused = False
-        with torch.npu.stream(origin):
-            for _ in range(_ALLOCATOR_REUSE_ATTEMPTS):
-                replacement = torch.empty_like(expected)
-                replacement.zero_()
-                poison.append(replacement)
-                reused |= replacement.untyped_storage().data_ptr() == released_pointer
-            origin.synchronize()
-        reader.synchronize()
-        print(f"clone_storage_reused={reused}", flush=True)
+        if lifetime_only:
+            # Try reusing the released allocation while the later slot reads it.
+            with torch.npu.stream(origin):
+                for _ in range(_ALLOCATOR_REUSE_ATTEMPTS):
+                    replacement = torch.empty_like(expected)
+                    replacement.zero_()
+                    poison.append(replacement)
+                origin.synchronize()
 
-    packed_broadcast_consumer(
-        iter([("layer.w0", ([_RETAINED_WEIGHT_ELEMENTS], torch.float32)), ("layer.w1", ([1], torch.float32))]),
-        SimpleNamespace(broadcast=receive),
-        0,
-        load,
-        1,
-        2,
-    )
+    with patch.object(torch.Tensor, "clone", clone):
+        packed_broadcast_consumer(
+            iter([("layer.w0", ([_RETAINED_WEIGHT_ELEMENTS], torch.float32)), ("layer.w1", ([1], torch.float32))]),
+            SimpleNamespace(broadcast=receive),
+            0,
+            load,
+            1,
+            num_buffers,
+        )
     torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=0, atol=0)
