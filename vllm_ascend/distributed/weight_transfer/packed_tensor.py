@@ -130,17 +130,11 @@ def _hccl_group(group, num_buffers, *, is_producer=False):
         # Use the same accelerator index/cache key as the upstream loops.
         streams = _get_hccl_streams(device_idx, num_buffers)
         transport = _HCCLPackedGroup(group, streams, is_producer=is_producer)
-        error = None
         try:
             yield transport
         except BaseException as exc:
-            error = exc
+            _drain_packed_streams(streams, transport.buffers, exc)
             raise
-        finally:
-            # Upstream drains every slot before returning on the normal path;
-            # only failures need the local retention/priority machinery.
-            if error is not None:
-                _drain_packed_streams(streams, transport.buffers, error)
 
 
 def _checked_callback(callback):
