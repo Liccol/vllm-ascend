@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Exercise retained layer inputs across real NPU slot streams."""
+"""Exercise retained layer inputs on real NPU unpack and caller streams."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,7 +20,7 @@ _ALLOCATOR_REUSE_ATTEMPTS = 64
 @pytest.mark.parametrize(
     "lifetime_only,num_buffers",
     [(False, 1), (False, 2), (True, 2)],
-    ids=["ready-single-slot", "ready-cross-slot", "lifetime-cross-slot"],
+    ids=["ready-single-slot", "ready-cross-slot", "lifetime-caller-stream"],
 )
 def test_retained_layer_clone_is_ready_and_alive(lifetime_only, num_buffers):
     torch.npu.set_device(0)
@@ -60,21 +60,11 @@ def test_retained_layer_clone_is_ready_and_alive(lifetime_only, num_buffers):
             retained.extend(tensor for _, tensor in weights)
             origin = torch.npu.current_stream()
             return
-        first = retained.pop()
         if lifetime_only:
-            # Complete the clone so this variant isolates allocator lifetime.
-            origin.synchronize()
-            delay()
+            return
+        first = retained.pop()
         output.copy_(first)
         del first
-        if lifetime_only:
-            # Try reusing the released allocation while the later slot reads it.
-            with torch.npu.stream(origin):
-                for _ in range(_ALLOCATOR_REUSE_ATTEMPTS):
-                    replacement = torch.empty_like(expected)
-                    replacement.zero_()
-                    poison.append(replacement)
-                origin.synchronize()
 
     with patch.object(torch.Tensor, "clone", clone):
         packed_broadcast_consumer(
@@ -82,7 +72,19 @@ def test_retained_layer_clone_is_ready_and_alive(lifetime_only, num_buffers):
             SimpleNamespace(broadcast=receive),
             0,
             load,
-            1,
+            expected.nbytes,
             num_buffers,
         )
+    if lifetime_only:
+        delay()
+        first = retained.pop()
+        output.copy_(first)
+        del first
+        # Reuse on the allocating unpack stream while the caller still reads.
+        with torch.npu.stream(origin):
+            for _ in range(_ALLOCATOR_REUSE_ATTEMPTS):
+                replacement = torch.empty_like(expected)
+                replacement.zero_()
+                poison.append(replacement)
+            origin.synchronize()
     torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=0, atol=0)

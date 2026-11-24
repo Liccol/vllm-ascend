@@ -193,6 +193,7 @@ def test_receive_weights_rebuilds_with_rebuild_npu_tensor():
 def test_start_weight_update():
     engine = object.__new__(NPUIPCWeightTransferEngine)
     engine.model = MagicMock()
+    engine.packed = False
     mock_init = MagicMock()
 
     with _patch_reload_module(initialize=mock_init):
@@ -206,7 +207,7 @@ def test_finish_weight_update():
     engine.model = MagicMock()
     engine.model_config = MagicMock()
     engine.device = torch.device("cpu")
-    engine._packed_importer = MagicMock()
+    consumer = engine._packed_consumer = MagicMock()
     mock_finalize = MagicMock()
 
     with _patch_reload_module(finalize=mock_finalize):
@@ -216,43 +217,35 @@ def test_finish_weight_update():
         mock_finalize.assert_called_once_with(engine.model, engine.model_config)
     else:
         mock_finalize.assert_called_once_with(engine.model, engine.model_config, engine.device)
-    engine._packed_importer.close.assert_called_once_with()
+    consumer.close.assert_called_once_with()
+    assert engine._packed_consumer is None
 
 
 def test_receive_packed_weights_loads_model():
     packed_weights = [("model.weight", torch.tensor([1.0, 2.0, 3.0]))]
-    update_info = MagicMock(
-        tensor_sizes=[12],
+    info = types.SimpleNamespace(
         ipc_handles={"node-0": ("packed-handle",)},
         names=["model.weight"],
         shapes=[[3]],
         dtype_names=["float32"],
+        chunk_capacity=16,
+        last=True,
     )
-
     engine = object.__new__(NPUIPCWeightTransferEngine)
     engine.model = MagicMock()
-    engine.device = MagicMock(index=0)
+    engine.device = types.SimpleNamespace(index=0)
     engine.packed = True
-    engine._packed_importer = MagicMock()
-
-    with (
-        patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"),
-        patch(
-            f"{_MODULE}.packed_npu_ipc_consumer",
-            return_value=packed_weights,
-        ) as mock_consumer,
-    ):
-        engine.receive_weights(update_info)
-
-    mock_consumer.assert_called_once_with(
-        ipc_handle=update_info.ipc_handles,
-        physical_npu_id="node-0",
-        names=update_info.names,
-        shapes=update_info.shapes,
-        dtype_names=update_info.dtype_names,
-        tensor_sizes=update_info.tensor_sizes,
-        device_index=0,
-        importer=engine._packed_importer,
+    consumer = engine._packed_consumer = MagicMock()
+    consumer.receive.return_value = packed_weights
+    with patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"):
+        engine.receive_weights(info)
+    consumer.receive.assert_called_once_with(
+        ipc_handle=info.ipc_handles,
+        names=info.names,
+        shapes=info.shapes,
+        dtype_names=info.dtype_names,
+        chunk_capacity=16,
+        last=True,
     )
     engine.model.load_weights.assert_called_once_with(packed_weights)
 
@@ -297,7 +290,12 @@ def test_packed_sender_waits_before_reusing_each_chunk(is_sender):
         assert kwargs["buffer_size_bytes"] == 16
         for i in range(2):
             yield PackedIpcChunk(
-                names=[f"w{i}"], dtype_names=["float32"], shapes=[[4]], tensor_sizes=[16], ipc_handle={"node-0": (i,)}
+                names=[f"w{i}"],
+                dtype_names=["float32"],
+                shapes=[[4]],
+                chunk_capacity=16 if i == 0 else None,
+                last=i == 1,
+                ipc_handle={"node-0": (i,)} if i == 0 else None,
             )
             assert events[-1] == "sync"
             events.append("reuse")
@@ -310,7 +308,7 @@ def test_packed_sender_waits_before_reusing_each_chunk(is_sender):
     ):
         engine._send_packed(engine.source)
     expected_chunk = ["update", "sync", "reuse"] if is_sender else ["sync", "reuse"]
-    assert events == expected_chunk * 2
+    assert events == expected_chunk + ["sync"] + expected_chunk
     assert engine.client.update_weights.call_count == (2 if is_sender else 0)
     for i, call in enumerate(engine.client.update_weights.call_args_list):
         payload = call.args[0]
@@ -318,8 +316,9 @@ def test_packed_sender_waits_before_reusing_each_chunk(is_sender):
         assert payload["names"] == [f"w{i}"]
         assert payload["dtype_names"] == ["float32"]
         assert payload["shapes"] == [[4]]
-        assert payload["tensor_sizes"] == [16]
-        assert payload["ipc_handles"] == {"node-0": (i,)}
+        assert payload["chunk_capacity"] == (16 if i == 0 else None)
+        assert payload["last"] is (i == 1)
+        assert payload["ipc_handles"] == ({"node-0": (0,)} if i == 0 else {})
 
 
 @pytest.mark.parametrize("is_sender", [False, True])
@@ -342,22 +341,24 @@ def test_multi_rank_handles_are_merged_and_synchronized_on_npu(is_sender):
         patch.object(torch.distributed, "barrier", side_effect=lambda: events.append("barrier")),
         patch.object(torch, "npu", types.SimpleNamespace(synchronize=lambda: events.append("npu")), create=True),
         patch.object(torch.cuda, "synchronize", side_effect=AssertionError("CUDA used")),
+        patch.object(torch.accelerator, "synchronize", side_effect=lambda: events.append("npu")),
     ):
         result = engine._all_gather_and_merge_handles(local)
     assert events == ["gather", "barrier", "npu"]
     assert result == ([{**local[i], **remote[i]} for i in range(2)] if is_sender else [{}, {}])
 
 
-def test_packed_receive_rejects_missing_sizes():
+def test_packed_receive_requires_update_lifecycle():
     engine = object.__new__(NPUIPCWeightTransferEngine)
     engine.device = types.SimpleNamespace(index=1)
     engine.packed = True
+    engine._packed_consumer = None
     engine.model = MagicMock()
     with (
         patch(f"{_MODULE}.npu_generate_uuid", return_value="node-1"),
-        pytest.raises(ValueError, match="tensor_sizes.*required"),
+        pytest.raises(RuntimeError, match="start_weight_update"),
     ):
-        engine.receive_weights(types.SimpleNamespace(tensor_sizes=None))
+        engine.receive_weights(types.SimpleNamespace())
     engine.model.load_weights.assert_not_called()
 
 
@@ -454,7 +455,8 @@ def test_packed_export_imported_once_with_fresh_payload_and_release(cleanup):
         names=["w"],
         dtype_names=["float32"],
         shapes=[[2]],
-        tensor_sizes=[8],
+        chunk_capacity=16,
+        last=False,
         ipc_handles={"node-0": (None,) * 6 + (999, "export-1")},
     )
     with (
@@ -462,9 +464,10 @@ def test_packed_export_imported_once_with_fresh_payload_and_release(cleanup):
         _patch_reload_module(),
         patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"),
     ):
+        engine.start_weight_update()
         engine.receive_weights(info)
         staging.copy_(torch.tensor([3.0, 4.0]))
-        engine.receive_weights(info)
+        engine.receive_weights(replace(info, names=["w2"], ipc_handles={}, chunk_capacity=None, last=True))
         assert len(imports) == 1
         assert imports[0]() is not None
         assert torch.equal(loaded[0], torch.tensor([1.0, 2.0]))
@@ -473,7 +476,8 @@ def test_packed_export_imported_once_with_fresh_payload_and_release(cleanup):
         assert imports[0]() is None
         # Cleanup is idempotent; a later update must open a new mapping.
         getattr(engine, cleanup)()
-        next_info = replace(info, ipc_handles={"node-0": (None,) * 6 + (999, "export-2")})
+        engine.start_weight_update()
+        next_info = replace(info, last=True, ipc_handles={"node-0": (None,) * 6 + (999, "export-2")})
         engine.receive_weights(next_info)
         assert len(imports) == 2
         engine.shutdown()
@@ -481,10 +485,10 @@ def test_packed_export_imported_once_with_fresh_payload_and_release(cleanup):
 
 
 def test_packed_export_replacement_and_failed_rebuild_release():
-    from vllm_ascend.distributed.weight_transfer.packed_tensor import NPUPackedBufferImporter
+    from vllm_ascend.distributed.weight_transfer.packed_tensor import NPUPackedIpcConsumer
 
-    importer = NPUPackedBufferImporter()
-    staging = torch.zeros(8, dtype=torch.uint8)
+    consumer = NPUPackedIpcConsumer(0, "node-0")
+    staging = torch.zeros(16, dtype=torch.uint8)
     refs = []
 
     def rebuild(*args):
@@ -494,15 +498,16 @@ def test_packed_export_replacement_and_failed_rebuild_release():
         refs.append(weakref.ref(mapping))
         return mapping
 
+    def receive(export):
+        return consumer.receive({"node-0": (None,) * 6 + (9, export)}, ["w"], [[1]], ["float32"], 16, True)
+
     with _patch_rebuild_npu_tensor(rebuild):
-        importer.rebuild(["same-storage", "refcount-slot-1"])
-        importer.rebuild(["same-storage", "refcount-slot-1"])
-        assert len(refs) == 1
-        importer.rebuild(["same-storage", "refcount-slot-2"])
-        assert refs[0]() is None
-        assert refs[1]() is not None
+        receive("first-export")
+        receive("second-export")
+        assert len(refs) == 2
+        assert refs[0]() is None and refs[1]() is not None
         with pytest.raises(RuntimeError, match="cannot import"):
-            importer.rebuild(["same-storage", "bad-export"])
+            receive("bad-export")
         assert refs[1]() is not None
-        importer.close()
+        consumer.close()
         assert refs[1]() is None
