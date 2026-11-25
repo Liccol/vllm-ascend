@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""DeepSeek-V4.1 Engram host-offload over unpacked NPU IPC, timed independently.
+"""Reduced DeepSeek-V4.1 IPC coverage using the shared TP2 transaction."""
 
-The scope is documented above ``DEEPSEEK_V41_ENGRAM_CASE``: this lane covers
-sleep/restore and the non-Engram updates, not an Engram value update.
-"""
+from dataclasses import replace
 
 import pytest
 
@@ -20,5 +18,5 @@ from tests.e2e.common.rlhf.weight_transfer.npu_ipc import (
 
 
 @pytest.mark.parametrize(("case", "packed"), pytest_model_cases("npu_ipc", model_cases=DEEPSEEK_V41_CASES))
-def test_npu_ipc_weight_transfer_transaction(case: WeightUpdateModelCase, packed: bool):
-    run_npu_ipc_weight_transfer_transaction(case, packed)
+def test_npu_ipc_weight_transfer_transaction(case: WeightUpdateModelCase, packed: bool, deepseek_v41_checkpoint):
+    run_npu_ipc_weight_transfer_transaction(replace(case, model=deepseek_v41_checkpoint), packed)

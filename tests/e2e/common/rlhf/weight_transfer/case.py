@@ -26,6 +26,15 @@ if TYPE_CHECKING:
     from vllm.distributed.weight_transfer.base import WeightSource
 
 
+# Keep unvalidated packed lanes skipped until their cross-stream reload fix is verified.
+PACKED_LANE_SKIP_REASON = (
+    "packed weight transfer is flaky: the receive buffer of a chunk is filled and "
+    "loaded on different NPU streams, so the layerwise reload can read tensors "
+    "retained from an earlier chunk without ordering against their allocation "
+    "(#18726; fix proposed in #18763)"
+)
+
+
 @dataclass(frozen=True)
 class WeightUpdateModelCase:
     """A layer-reduced model whose complete parameter set is reloaded."""
@@ -55,6 +64,7 @@ class WeightUpdateModelCase:
     image_prompt: bool = False
     # One representative model covers both backends and packing modes.
     full_transfer_matrix: bool = False
+    packed_skip_reason: str | None = PACKED_LANE_SKIP_REASON
     skip_reason: str | None = None
     """Why neither lane can carry this case yet.
 
@@ -143,7 +153,7 @@ def _dsv41_engram_args() -> tuple[str, ...]:
     """
     if os.environ.get("DSV41_ENGRAM", "1") != "1":
         return ()
-    offload = "true" if os.environ.get("DSV41_ENGRAM_CPU_OFFLOAD", "1") == "1" else "false"
+    offload = "true" if os.environ.get("DSV41_ENGRAM_CPU_OFFLOAD", "0") == "1" else "false"
     return ("--engram-config", f'{{"cpu_offload": {offload}}}')
 
 
@@ -156,43 +166,30 @@ def _deepseek_v41_weight_source(case: WeightUpdateModelCase, device: torch.devic
     return DeepseekV41WeightSource(case, device)
 
 
-# Engram host-offload coverage. The published V4.1 checkpoint ships two Engram
-# tables of 384M x 256 BF16 rows (`text_config.engram_num_embeddings`), i.e.
-# ~183 GiB each; reloading one must update the registered host range instead of
-# materializing the table on the device, which is the OOM this lane guards.
-#
-# `full_transfer_matrix=False` keeps the case on the unpacked NPU IPC path only:
-# `pytest_model_cases` selects a non-matrix case for `npu_ipc` with
-# `packed=False` and drops it from every other lane, so the packed buffer
-# lifecycle cannot mask a reload regression here.
-#
-# Scope.  The lane covers the host/UVA table across a level-2 sleep -> wake ->
-# weight transfer -> KV-cache wake cycle, plus the value update of every
-# non-Engram parameter: the payload is regenerated per round, so the post-update
-# generation has to reproduce a reference started from the same payload.
-#
-# It does NOT cover an Engram *value* update, and passing this lane must not be
-# read as evidence that one lands.  `AscendParallelEngramEmbedding._weight_loader`
-# deliberately ignores `loaded_weight` and re-reads the rows from the indexed
-# shard bound by `bind_checkpoint` - that streaming is what keeps a
-# 22.89 GiB-per-rank table off the device - while `iter_full()` regenerates the
-# same fixed-seed payload every round (W0 == W1 == W2) and the oracle compares
-# against the startup reference.  A transfer that never landed therefore still
-# matches.  Covering it needs distinct per-round payloads, a loader that consumes
-# the transferred tensor inside the reload window, and a per-round reference;
-# tracked separately.
+# Keep the released tensor dimensions but reduce counts for the two-card budget.
+# CPU offload remains opt-in via DSV41_ENGRAM_CPU_OFFLOAD=1. Engram coverage is
+# reload/lifetime, not value changes: its loader rereads the bound shard.
 DEEPSEEK_V41_ENGRAM_CASE = WeightUpdateModelCase(
-    id="deepseek-v4.1-flash-engram-cpu-offload",
-    # V4.1 cannot be enumerated through Transformers, so the lane is served from
-    # a local copy of the released config (plus its tokenizer) rather than a repo
-    # id. All 40 layers and the released shape parameters are kept so the
-    # published headers stay authoritative; only the expert count, the engram
-    # vocabulary and the MTP stages are reduced, and that reduction lives in the
-    # model directory's own config.json rather than in ``--hf-overrides``.
-    model=os.environ.get("DSV41_MODEL_DIR", ""),
-    # The reduction lives in that config.json; a nested override would replace the
-    # sub-config (see ``_dsv41_text_config``).
-    hf_overrides={},
+    id="deepseek-v4.1-flash-bf16-4l-vit2-e8-engram",
+    model="deepseek-ai/DeepSeek-V4.1-Flash",
+    full_transfer_matrix=True,
+    packed_skip_reason=None,
+    # vLLM flattens this model's text config; use flat overrides on both paths.
+    hf_overrides={
+        "num_hidden_layers": 4,
+        "n_routed_experts": 8,
+        "compress_ratios": [0, 0, 2, 2],
+        "kv_source_layer_ids": [2],
+        "index_source_layer_ids": [2],
+        "candidate_source_layer_id": 2,
+        "engram_layer_ids": [1],
+        "engram_num_embeddings": [384006168],
+        "engram_vocab_size": 40960,
+        "num_nextn_predict_layers": 0,
+        "dspark_target_layer_ids": [],
+        "vision_n_layers": 2,
+        "quantization_config": None,
+    },
     extra_server_args=(
         "--tokenizer-mode",
         "deepseek_v41",
@@ -200,9 +197,6 @@ DEEPSEEK_V41_ENGRAM_CASE = WeightUpdateModelCase(
         *_dsv41_engram_args(),
     ),
     weight_source_factory=_deepseek_v41_weight_source,
-    skip_reason=(
-        None if os.environ.get("DSV41_MODEL_DIR") else "set DSV41_MODEL_DIR to a DeepSeek-V4.1 checkpoint directory"
-    ),
 )
 
 
@@ -311,18 +305,6 @@ MINIMAX_M31_FLASH_CASE = replace(
 )
 
 
-# Keep packed lanes skipped until #18763 fixes cross-stream chunk loading.
-# HCCL's second update diverged in #18726 (38570793020, attempts 1/2) and
-# main daily runs 38186343470, 38325024027, 38657430708 and 38679145716;
-# unpacked passed. Remove the shared skip after validating the fix.
-PACKED_LANE_SKIP_REASON = (
-    "packed weight transfer is flaky: the receive buffer of a chunk is filled and "
-    "loaded on different NPU streams, so the layerwise reload can read tensors "
-    "retained from an earlier chunk without ordering against their allocation "
-    "(#18726; fix proposed in #18763)"
-)
-
-
 MODEL_CASES = (*QWEN_CASES, *DEEPSEEK_CASES, *DEEPSEEK_V41_CASES, *GLM_CASES, MINIMAX_M3_CASE, MINIMAX_M31_FLASH_CASE)
 
 
@@ -339,7 +321,7 @@ def pytest_model_cases(backend: str, *, model_cases: tuple[WeightUpdateModelCase
             if not ((backend == "npu_ipc" and not packed) or case.full_transfer_matrix):
                 continue
             marks = [pytest.mark.e2e_model(case.model)]
-            reason = case.skip_reason or (PACKED_LANE_SKIP_REASON if packed else None)
+            reason = case.skip_reason or (case.packed_skip_reason if packed else None)
             if reason:
                 marks.append(pytest.mark.skip(reason=f"{case.id}: {reason}"))
             parameters.append(

@@ -34,6 +34,7 @@ import regex as re
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.distributed.weight_transfer.base import ParamMeta, WeightSource
+from vllm.transformers_utils.config import get_config
 
 from tests.e2e.common.rlhf.weight_transfer.case import WeightUpdateModelCase
 
@@ -318,19 +319,8 @@ class TensorSpec:
 
 
 def _dsv41_text_config(case: Any) -> dict[str, Any]:
-    """The reduced model's own ``text_config``.
-
-    The case's ``hf_overrides`` deliberately is *not* the authority.  vLLM's
-    ``DeepseekV41Config`` flattens the released ``text_config`` onto the
-    top-level config object, so a nested ``{"text_config": {...}}`` override
-    replaces that sub-config instead of merging into it, dropping every field it
-    does not restate — ``num_attention_heads`` among them, which ``ModelConfig``
-    then rejects: "The text_config extracted from the model config does not have
-    ``num_attention_heads``".  Reading the directory the lane is actually served
-    from keeps this source and the server in agreement by construction.
-    """
-    config = json.loads((Path(case.model) / "config.json").read_text())
-    return config.get("text_config", config)
+    """Use vLLM's flattened config and the same overrides as both servers."""
+    return get_config(case.model, trust_remote_code=case.trust_remote_code, hf_overrides_kw=case.hf_overrides).to_dict()
 
 
 def _dsv41_engram_table_shapes(text_config: dict[str, Any]) -> dict[str, tuple[int, int]]:
@@ -439,10 +429,9 @@ class DeepseekV41WeightSource(WeightSource):
     checkpoint's safetensors headers instead of a Transformers meta model, which
     V4.1 does not have.
 
-    The lane keeps every layer and the released ``hidden_size`` / ``head_dim`` /
-    ``moe_intermediate_size``, so a surviving tensor has the shape the checkpoint
-    gives it; only counts shrink (experts, Engram vocabulary, MTP stages, vision
-    blocks), and that reduction lives in the model directory's own ``config.json``.
+    The lane keeps the released ``hidden_size`` / ``head_dim`` /
+    ``moe_intermediate_size``; only counts shrink (layers, experts, Engram
+    vocabulary, MTP stages, vision blocks) through the case's HF overrides.
     Two deliberate exceptions to "headers are the truth":
 
     * the Engram table's row count is derived from the real ``EngramLayout``
@@ -463,14 +452,7 @@ class DeepseekV41WeightSource(WeightSource):
         self._num_nextn = int(text.get("num_nextn_predict_layers", 0))
         self._engram_layer_ids = tuple(text.get("engram_layer_ids") or ())
         self._engram_shapes = _dsv41_engram_table_shapes(text) if self._engram_layer_ids else {}
-        self._num_vision_blocks = int(
-            json.loads((Path(case.model) / "config.json").read_text())
-            .get("vision_config", {})
-            .get("num_hidden_layers", 2)
-        )
-        # The model directory also carries the config and tokenizer the reference
-        # startup-load checkpoint has to reproduce.
-        self._model_dir = Path(case.model)
+        self._num_vision_blocks = int(text["vision_n_layers"])
         self._specs = self._read_layout()
 
     # -- layout -------------------------------------------------------------
@@ -592,31 +574,18 @@ class DeepseekV41WeightSource(WeightSource):
         return max(int(torch.tensor(spec.shape).prod()) * spec.dtype.itemsize for spec in self._specs)
 
     def write_checkpoint(self, directory: str | Path) -> None:
-        """Materialise this source's payload as a normally-loadable checkpoint.
+        """Write an indexed checkpoint for Engram's shard-binding preflight.
 
-        Unlike ``FixedRandomWeightSource`` this shards the tensors behind a
-        ``model.safetensors.index.json``: the config and tokenizer come from the
-        lane's own model directory, and a single ``model.safetensors`` is not
-        enough once engram is enabled, because the engram preflight rejects
-        anything that is not an *indexed* checkpoint — "Engram table
-        'layers.N.engram.embed.weight' is not in an indexed safetensors
-        checkpoint ... (found: no index)".
-
-        The config is copied rather than re-serialised on purpose: a
-        re-serialised config would carry the derived fields a runtime config
-        object holds, which matches neither the published file nor survives
-        validation once the layer count is reduced.
+        Both servers apply the same case overrides to the unmodified config.
+        Include the tokenizer so the live model can bind these local shards.
         """
         from safetensors.torch import save_file
+        from transformers.utils.hub import cached_file
 
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
-        for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"):
-            source = self._model_dir / name
-            if source.exists():
-                shutil.copyfile(source, target / name)
-            elif name == "config.json":
-                raise FileNotFoundError(f"{self._case.id}: {source} is required to build the reference")
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            shutil.copyfile(cached_file(self._case.model, name), target / name)
 
         weight_map: dict[str, str] = {}
         total_size = 0
@@ -636,8 +605,7 @@ class DeepseekV41WeightSource(WeightSource):
             shard = {}
             shard_bytes = 0
 
-        # A few GiB per shard, so the 49 GiB payload never has to sit in host
-        # memory all at once.
+        # Bound host memory while materializing the checkpoint.
         for name, tensor in self:
             tensor = tensor.detach().to("cpu").contiguous()
             shard[name] = tensor
@@ -657,11 +625,7 @@ class DeepseekV41WeightSource(WeightSource):
             encoding="utf-8",
         )
 
-        # Every tensor above was materialised on the NPU and then copied to CPU.
-        # The caching allocator keeps those blocks, and at 40 layers the retained
-        # total is enough to starve the server that starts next on the same chip
-        # ("Free memory on device ... is less than desired GPU memory
-        # utilization"), so hand the memory back explicitly.
+        # Release temporary payload storage before the co-located server starts.
         if self._device.type == "npu":
             torch.npu.empty_cache()
 
