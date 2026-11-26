@@ -54,6 +54,7 @@ def test_host_uva_aligns_registration_and_frees_original_allocation(monkeypatch,
             return 0
 
         def aclrtHostRegisterV2(self, pointer, count, flags):
+            assert flags == 0x2
             assert count == size and pointer.value % alignment == 0
             self.registered = pointer.value
             return 1 if failure == "register" else 0

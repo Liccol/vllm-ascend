@@ -4,7 +4,7 @@
 
 Tables are BF16, INT8/FP32 or native MXFP8/E8M0, sharded into contiguous hash
 head buckets.  With ``EngramConfig.cpu_offload`` the shard stays in host memory:
-``aclrtHostRegisterV2`` pins it and ``aclrtHostGetDevicePointer`` publishes the
+``aclrtHostRegisterV2`` maps it and ``aclrtHostGetDevicePointer`` publishes the
 address the NPU gather kernel reads, so an offloaded table needs neither an H2D
 copy nor a host-side gather.
 """
@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.device_op import ACL_HOST_REG_MAPPED, DeviceOperator
 
 SCALE_GROUP = 32
 # A 384M row table overflows the 32 bit offset arithmetic a single Triton tile
@@ -165,7 +165,10 @@ class HostUvaBuffer:
         self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
         self.tensor = torch.frombuffer(self.buffer, dtype=dtype).reshape(shape)
         try:
-            rc = self.lib.aclrtHostRegisterV2(self.pointer, size, DeviceOperator.host_register_flags())
+            # aclrtMallocHost already pins this allocation. A redundant PINNED
+            # flag is rejected by some A3 runtimes; shared mappings still need
+            # the device-specific flags in SharedUvaBuffer.
+            rc = self.lib.aclrtHostRegisterV2(self.pointer, size, ACL_HOST_REG_MAPPED)
             if rc:
                 raise RuntimeError(f"aclrtHostRegisterV2 failed: rc={rc} size={size}")
             address = ctypes.c_void_p()
