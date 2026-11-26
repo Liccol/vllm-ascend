@@ -3,6 +3,7 @@
 # ruff: noqa: E402
 """Focused tests for the Ascend Engram configuration and storage path."""
 
+import ctypes
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -181,6 +182,15 @@ def test_loader_applies_mxfp8_checkpoint_scales(tmp_path):
 
 def _fake_host_library(device_offset):
     class Library:
+        def aclrtMallocHost(self, out, size, flags):
+            self.storage = ctypes.create_string_buffer(size)
+            out._obj.value = ctypes.addressof(self.storage)
+            return 0
+
+        def aclrtFreeHost(self, pointer):
+            self.storage = None
+            return 0
+
         def aclrtHostRegisterV2(self, pointer, size, flags):
             return 0
 
@@ -192,6 +202,63 @@ def _fake_host_library(device_offset):
             return 0
 
     return Library()
+
+
+def test_offloaded_table_preserves_storage_and_pointer_buffers_on_reload(tmp_path, monkeypatch):
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    key = "layers.1.engram.embed.weight"
+    scale_key = "layers.1.engram.embed.scale"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "model.safetensors", scale_key: "model.safetensors"}})
+    )
+    monkeypatch.setattr(npu, "_host_library", lambda: _fake_host_library(1 << 40))
+    monkeypatch.setattr(embedding_mod, "in_the_same_node_as", lambda group: [True])
+    monkeypatch.setattr(embedding_mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=None))
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_group", lambda: None)
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(embedding_mod, "get_tensor_model_parallel_rank", lambda: 0)
+
+    def allocate(table):
+        table._codes_uva = npu.HostUvaBuffer((8, 64), torch.int8, "cpu")
+        table._scales_uva = npu.HostUvaBuffer((8, 2), torch.float32, "cpu")
+        return table._codes_uva.tensor, table._scales_uva.tensor
+
+    monkeypatch.setattr(embedding_mod.AscendParallelEngramEmbedding, "_allocate_weights", allocate)
+    table = embedding_mod.AscendParallelEngramEmbedding(8, 64, (4, 4), 0, cpu_offload=True)
+    table.bind_checkpoint(tmp_path, key)
+    params = dict(table.named_parameters())
+    pointers = {name: param.data_ptr() for name, param in params.items()}
+    loaders = {name: param.weight_loader for name, param in params.items()}
+    for name in ("_codes_uva", "_scales_uva"):
+        assert dict(table.named_buffers())[f"{name}_ptrs"] is getattr(table, name).ptrs
+        assert f"{name}_ptrs" not in table.state_dict()
+    record_metadata_for_reloading(table)
+    try:
+        for value in (1, 2, 1):
+            codes = torch.full((8, 64), value, dtype=torch.int8)
+            scales = torch.full((8, 2), value, dtype=torch.float32)
+            save_file({key: codes, scale_key: scales}, tmp_path / "model.safetensors")
+            initialize_layerwise_reload(table)
+            for name, param in params.items():
+                assert getattr(table, name) is param
+                assert not param.is_meta
+                assert param.weight_loader is loaders[name]
+            table.weight.weight_loader(table.weight, codes)
+            table.weight_scale_inv.weight_loader(table.weight_scale_inv, scales)
+            finalize_layerwise_reload(table, SimpleNamespace(dtype=torch.bfloat16))
+            for name, param in params.items():
+                assert getattr(table, name) is param
+                assert param.data_ptr() == pointers[name]
+            torch.testing.assert_close(table._codes_uva.tensor, codes)
+            torch.testing.assert_close(table._scales_uva.tensor, scales)
+    finally:
+        table.close_host_offload()
 
 
 @pytest.mark.parametrize("leader_rank", [0, 16])

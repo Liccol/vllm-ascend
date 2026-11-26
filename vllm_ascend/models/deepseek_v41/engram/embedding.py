@@ -67,6 +67,8 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             raise ValueError(f"Unsupported Engram storage dtype: {storage_dtype}")
         self.scale_dtype = torch.uint8 if storage_dtype == torch.float8_e4m3fn else torch.float32
         self.cpu_offload = cpu_offload
+        # Reload must preserve the host storage mapped by the lookup kernel.
+        self._skip_layerwise_reload = cpu_offload
         self.layer_hash_index = layer_hash_index
         self._shared_group = None
         if not all(in_the_same_node_as(get_tp_group().cpu_group)):
@@ -110,6 +112,11 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self.vocab_end_idx = sum(head_sizes[: self.head_start + self.part_n_hash_cols])
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         weight, scales = self._allocate_weights()
+        for name in ("_codes_uva", "_scales_uva"):
+            buffer = getattr(self, name)
+            if buffer is not None:
+                # Level-2 sleep saves registered buffers before freeing HBM.
+                self.register_buffer(f"{name}_ptrs", buffer.ptrs, persistent=False)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False) if scales is not None else None
         for param in (self.weight, self.weight_scale_inv):

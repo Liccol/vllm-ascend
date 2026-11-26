@@ -21,6 +21,7 @@ from vllm.model_executor.model_loader.reload.layerwise import (
 from vllm_ascend.models.deepseek_v4 import dspark as dspark_module
 from vllm_ascend.models.deepseek_v4 import model as target_module
 from vllm_ascend.models.deepseek_v4 import mtp as mtp_module
+from vllm_ascend.models.deepseek_v41 import model as v41_module
 
 TOTAL_HEADS = 16
 TARGET_LAYER_IDX = 3
@@ -73,30 +74,35 @@ class _SinkOnlyModel(nn.Module):
     _remap_dspark_name = dspark_module.DSparkDeepseekV4ForCausalLM._remap_dspark_name
 
 
-@pytest.fixture(params=["target", "mtp", "dspark"])
+@pytest.fixture(params=["target", "mtp", "dspark", "v41"])
 def sink_path(request, monkeypatch):
     """Patch distributed/config dependencies, keeping real loaders and mappings."""
     path = request.param
-    modules = {"target": target_module, "mtp": mtp_module, "dspark": dspark_module}
+    modules = {"target": target_module, "mtp": mtp_module, "dspark": dspark_module, "v41": v41_module}
     loaders = {
         "target": target_module.AscendDeepseekV4ForCausalLM.load_weights,
         "mtp": mtp_module.DeepSeekV4MTP.load_weights,
         "dspark": dspark_module.DSparkDeepseekV4ForCausalLM.load_weights,
+        "v41": v41_module.AscendDeepseekV41LLMForCausalLM._load_model_weights,
     }
     checkpoint_names = {
         "target": "model.layers.0.attn.attn_sink",
         "mtp": "mtp.0.attn.attn_sink",
         "dspark": f"mtp.{DSPARK_STAGE}.attn.attn_sink",
+        "v41": "layers.0.attn.attn_sink",
     }
     parameter_names = {
         "target": "model.layers.0.self_attn.attn_sink",
         "mtp": "model.layers.0.mtp_block.self_attn.attn_sink",
         "dspark": f"model.layers.{TARGET_LAYER_IDX + DSPARK_STAGE}.self_attn.attn_sink",
+        "v41": "model.layers.0.self_attn.attn_sink",
     }
-    for module in (target_module, mtp_module):
+    for module in (target_module, mtp_module, v41_module):
         monkeypatch.setattr(module, "fused_moe_make_expert_params_mapping", lambda *_, **__: [])
         monkeypatch.setattr(module, "get_ascend_config", lambda: SimpleNamespace(mix_placement=False))
     monkeypatch.setattr(target_module, "is_pp_missing_parameter", lambda *_: False)
+    monkeypatch.setattr(v41_module, "is_pp_missing_parameter", lambda *_: False)
+    monkeypatch.setattr(v41_module, "get_spec_layer_idx_from_weight_name", lambda *_: None)
     monkeypatch.setattr(dspark_module, "process_eagle_weight", lambda *_: None)
 
     def build(*, tp_size, tp_rank, dsa_cp=False, with_weight_loader=False):
