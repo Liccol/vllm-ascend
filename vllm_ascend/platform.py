@@ -405,6 +405,12 @@ class NPUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
+        # V4.1 cache specs already use the settled size. The parent's default
+        # would make metadata describe a different page layout after loading.
+        model_config = vllm_config.model_config
+        if model_config is not None and _get_deepseek_v4_variant(model_config) == "V4.1":
+            return
+
         super().update_block_size_for_backend(vllm_config)
 
         # TODO: NPU still sets block_size in check_and_update_config.

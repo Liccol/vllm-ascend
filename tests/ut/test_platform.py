@@ -328,6 +328,27 @@ def test_visible_device_id_to_physical_device_id():
         load_extension.assert_called_once_with("vllm_ascend.vllm_ascend_C")
 
 
+@pytest.mark.parametrize("block_size", [32, 128])
+@pytest.mark.parametrize(
+    "model_type",
+    ["deepseek_v41", "deepseek_v41_text", "deepseek_v4.1", "deepseek_v4.1_text", "llama"],
+)
+def test_backend_block_size_reselection_preserves_v41_cache_geometry(monkeypatch, model_type, block_size):
+    config = TestNPUPlatform.mock_vllm_config()
+    config.model_config.hf_config = SimpleNamespace(model_type=model_type)
+    config.model_config.hf_text_config = None
+    config.cache_config.block_size = block_size
+    config.cache_config.user_specified_block_size = False
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.kv_cache_dtype_skip_layers = []
+    backend = SimpleNamespace(get_preferred_block_size=lambda default: 16, get_name=lambda: "test")
+    monkeypatch.setattr(NPUPlatform, "_find_non_ssm_backend", classmethod(lambda cls, config: backend))
+
+    NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == (16 if model_type == "llama" else block_size)
+
+
 class TestNPUPlatform(TestBase):
     @staticmethod
     def mock_vllm_config():
